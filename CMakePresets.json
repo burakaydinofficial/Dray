@@ -1,0 +1,51 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "dev",
+      "displayName": "dev (Ninja, RelWithDebInfo)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/dray",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "GGML_METAL": "OFF",
+        "GGML_CUDA": "OFF"
+      }
+    },
+    {
+      "name": "linux",
+      "inherits": "dev",
+      "displayName": "linux (gcc/clang, Release)",
+      "binaryDir": "${sourceDir}/build-linux",
+      "condition": { "type": "notEquals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "win-arm64",
+      "displayName": "windows-arm64 (MSVC cross, UNTESTED on hardware)",
+      "binaryDir": "${sourceDir}/build-arm64",
+      "generator": "Visual Studio 17 2022",
+      "architecture": { "value": "ARM64", "strategy": "set" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GGML_METAL": "OFF",
+        "GGML_CUDA": "OFF"
+      }
+    },
+    {
+      "name": "linux-arm64",
+      "inherits": "dev",
+      "displayName": "linux-aarch64 (cross, UNTESTED on hardware)",
+      "binaryDir": "${sourceDir}/build-linux-arm64",
+      "toolchainFile": "${sourceDir}/cmake/aarch64-linux-gnu.toolchain.cmake",
+      "condition": { "type": "notEquals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "linux", "configurePreset": "linux" }
+  ],
+  "testPresets": [
+    { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error" } },
+    { "name": "linux", "configurePreset": "linux", "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error" } }
+  ]
+}

@@ -1,0 +1,40 @@
+# Build
+build/
+out/
+cmake-build-*/
+CMakeUserPresets.json
+
+# Models — never in-tree; see CLAUDE.md for the expected location
+# F1/G8: anchored -- the bare pattern swallowed src/models/ for the repo's
+# whole life, and the first fix put this comment ON the pattern line, where
+# git reads it as part of the pattern (inert). Comment lines start at col 0.
+/models/
+*.gguf
+
+# Traces, benchmark output, run logs
+traces/
+runs/
+*.jsonl
+
+# Tooling scratch
+.playwright-mcp/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# tooling scratch
+.claude/
+
+# server job state: the README quickstart writes --jobs-dir ./jobs into the
+# clone root, and multi-GB checkpoints land there
+/jobs/
+*.job
+*.lzs
+*.lzs.tmp
+
+build-vulkan/
+
+build-llamaref/

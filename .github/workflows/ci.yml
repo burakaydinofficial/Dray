@@ -1,0 +1,142 @@
+# CI encodes what is already proven by hand, not aspiration: the tree builds and
+# passes its unit suite on Windows (MSVC) and Linux (g++), verified 2026-08-14.
+#
+# What CI can and cannot check here:
+#   - unit tests need NO model weights (that is a design rule of the suite);
+#   - difftest and every measurement need multi-hundred-GB checkpoints and a
+#     calibrated local NVMe, so they stay on the workstation, by design. CI
+#     passing means "compiles + logic gates hold", never "performance verified".
+name: ci
+
+# BILLING (learned by draining a month's minutes in one afternoon): private
+# repos bill Actions minutes at 1x Linux / 2x Windows / 10x macOS, and a full
+# uncached board here costs ~400 billed minutes. Hence: docs pushes don't
+# build, overlapping runs cancel, compiler caches cut the vendored build, and
+# macOS -- 10x for a platform already proven green -- runs on manual dispatch.
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/cache@v4
+        with:
+          path: build
+          key: ${{ runner.os }}-${{ github.job }}-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', '.gitmodules') }}
+          restore-keys: ${{ runner.os }}-${{ github.job }}-
+      - name: configure
+        # No -G pin: windows-latest moved from VS 2022 to VS 2026 and the pin
+        # broke the maiden run; the default generator tracks the image.
+        run: cmake -B build -DGGML_METAL=OFF -DGGML_CUDA=OFF
+      - name: build
+        run: cmake --build build --config Release -j
+      - name: unit tests
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
+
+  macos:
+    # GitHub macos-latest runners are Apple silicon: permanent arm64 + macOS
+    # coverage without owner hardware -- the mitigation for "no Mac later".
+    # 10x billing multiplier on private repos: manual dispatch only, run it
+    # before a release or after platform-touching changes, not per push.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/cache@v4
+        with:
+          path: build
+          key: ${{ runner.os }}-${{ github.job }}-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', '.gitmodules') }}
+          restore-keys: ${{ runner.os }}-${{ github.job }}-
+      - name: configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=OFF -DGGML_CUDA=OFF
+      - name: build
+        run: cmake --build build -j
+      - name: unit tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+  windows-preset:
+    # T24: the DOCUMENTED build path, on the platform every published figure
+    # was measured on. CI was green while "cmake --preset dev" built Debug and
+    # reported every test Not Run; this job keeps the README's commands true.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/cache@v4
+        with:
+          path: build
+          key: ${{ runner.os }}-${{ github.job }}-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', '.gitmodules') }}
+          restore-keys: ${{ runner.os }}-${{ github.job }}-
+      - name: ninja
+        run: choco install ninja -y
+      - name: configure (documented path)
+        run: cmake --preset dev
+      - name: build (documented path)
+        run: cmake --build --preset dev -j
+      - name: unit tests (documented path)
+        run: ctest --preset dev --no-tests=error
+
+  linux-tsan:
+    # Swarm S17/S35: ThreadSanitizer over the unit suite. This job alone would
+    # have caught the /health race (S4/R2) the day it was written.
+    # ubuntu-22.04 runners received shutdown signals mid-job on the maiden run
+    # (image retirement brownouts); 24.04 is the supported image.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/cache@v4
+        with:
+          path: build
+          key: ${{ runner.os }}-${{ github.job }}-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', '.gitmodules') }}
+          restore-keys: ${{ runner.os }}-${{ github.job }}-
+      - name: io_uring headers
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev
+      - name: configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGGML_METAL=OFF -DGGML_CUDA=OFF -DCMAKE_CXX_FLAGS="-fsanitize=thread" -DCMAKE_C_FLAGS="-fsanitize=thread" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+      - name: build
+        # bare -j is UNLIMITED make parallelism; the heavy vendored TUs OOM a
+        # 16 GB runner (cc1plus Killed, run 2). Bound it to the core count.
+        run: cmake --build build -j 4
+      - name: unit tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+  linux:
+    # ubuntu-22.04 runners received shutdown signals mid-job on the maiden run
+    # (image retirement brownouts); 24.04 is the supported image.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/cache@v4
+        with:
+          path: build
+          key: ${{ runner.os }}-${{ github.job }}-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', '.gitmodules') }}
+          restore-keys: ${{ runner.os }}-${{ github.job }}-
+      - name: io_uring headers
+        run: sudo apt-get update && sudo apt-get install -y liburing-dev
+      - name: configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=OFF -DGGML_CUDA=OFF
+      - name: build
+        # bare -j is UNLIMITED make parallelism; see linux-tsan note.
+        run: cmake --build build -j 4
+      - name: unit tests
+        run: ctest --test-dir build --output-on-failure --no-tests=error
