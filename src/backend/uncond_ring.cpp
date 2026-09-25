@@ -241,6 +241,7 @@ void UncondRing::retire_dead_ring() {
                  "[dray] FATAL: backend dead with ring reads outstanding; "
                  "ring disabled and its memory retired (no-cancel contract)\n");
     active_ = false;
+    died_ = true;
 }
 
 void UncondRing::append(std::ostream& o) const {
@@ -261,8 +262,9 @@ void UncondRing::release_all() {
         dead = dead || d1;
     }
     queue_.clear();
-    // H15: leak only on a genuinely dead backend.
-    if (arena_ && !dead) p_.mem.free_uncharged(arena_, bytes_);
+    // H15: leak only on a genuinely dead backend -- seen now, or earlier by a
+    // consume/retire that already settled (and so cleared) the dying reads.
+    if (arena_ && !dead && !died_) p_.mem.free_uncharged(arena_, bytes_);
     else if (arena_) std::fprintf(stderr, "[dray] FATAL: teardown leaking the ring "
                                           "(backend died with reads outstanding)\n");
 }

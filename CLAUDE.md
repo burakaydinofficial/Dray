@@ -91,6 +91,9 @@ scripts/batchdiff.ps1    # within-batch identity, and compact ON vs OFF
 scripts/archgate.ps1     # ARCHITECTURE DIVERSITY -- slow, before shipping
 scripts/clonegate.ps1    # DOES THIS BUILD FOR A STRANGER -- before any push
                          # that touches the submodule or build files
+scripts/golden.ps1       # DID A REFACTOR CHANGE ANYTHING -- 25 cases (every
+scripts/serve-smoke.ps1  # command + every streamer lever), and every server
+                         # route incl. crash-resume; record before, compare after
 ```
 
 `archgate` is the newest and exists because the other three cannot catch what
@@ -160,11 +163,12 @@ wsl -d Ubuntu-22.04 -- env BIN=/home/you/dray-build/bin/dray bash /mnt/d/Project
 1. **Residency planner** — classifies every tensor, reserves the floor and the KV ceiling for the requested
    `n_ctx` up front, refuses admission if it does not fit. The cache never shrinks after load. At small caps
    this component decides almost all achieved performance.
-2. **Expert cache** — arena, index, refcounts, eviction. Slots for a layer live in **one contiguous per-layer
-   arena of uniform slot size**, so that layer's `ffn_*_exps` is a valid ggml tensor with `nb[2] = slot_size`;
-   a per-token remap tensor maps router-chosen ids to slot indices for `ggml_mul_mat_id`. This is forced —
-   `mul_mat_id` indexes all experts by one uniform stride, so scattered slots cannot be expressed by
-   repointing `tensor->data`. It is also why slots are per-layer size classes.
+2. **Expert compaction** — `mul_mat_id` indexes all experts by one uniform stride `nb[2]`, so scattered
+   memory cannot be expressed by repointing `tensor->data`. Per MUL_MAT_ID node, the streamer reads only the
+   router-selected experts into ONE compact region at the tensor's own stride, and repoints the node at a
+   PRIVATE remapped ids tensor (`0..k-1`); the shared router ids are never modified, so ADD_ID and scale
+   GET_ROWS still see real ids. This lives in `backend/expert_compactor.cpp` (`compact_experts`). The older
+   per-layer slot-arena design (`cache/expert_cache.*`) survives only behind the `stream` diagnostic.
 3. **Prefetch scheduler** — router output and speculation → coalesced ordered reads → queue sized by
    calibration. Prefill runs a different policy from decode.
 4. **Storage backend** — platform-specific uncached async reads behind one interface. Its submission and
@@ -178,6 +182,34 @@ wsl -d Ubuntu-22.04 -- env BIN=/home/you/dray-build/bin/dray bash /mnt/d/Project
    runs are jobs with checkpoint/resume, surfaced through the OpenAI protocol (streaming;
    reconnectable request ids).
 7. **Persistence** — checkpoints and resume. Cannot be retrofitted: every I/O primitive above is a *read*.
+
+## Source layout
+
+One CMake static library per concept, each linking only what it uses, so a layering violation is a link
+error (the graph is declared at the top of `CMakeLists.txt`):
+
+```
+src/main.cpp          dispatch table: command name -> cli/cmd_<name>.cpp
+src/cli/              args (the Args struct + parser), one file per command,
+                      reference_read (independent uncached reads for diagnostics)
+src/engine/           Engine (open steps in engine_setup.cpp; generate in engine.cpp),
+                      BatchGenerator, CohortRotator, StreamedText (stops + UTF-8),
+                      kv_overrides, thread_policy, engine_types.h (plain data)
+src/server/           serve_main (composition), RequestGuard, JobRegistry, JobStore
+                      (sidecars + checkpoints), JobWorker, chat_completions + http_routes,
+                      StopWatcher/shutdown, chat_prompt
+src/backend/          the Streamer. stream_buffer.h is the only public surface; streamer_impl.h
+                      composes one owner per concern: AccountedAlloc (the only allocator),
+                      PoisonBuffers, IoScheduler (every read, one tag registry), TensorRegistry,
+                      ResidencyCache (LRU, static pinning, eviction), ExpertCompactor (+PrivateIds),
+                      ExpertSlots (+RoutingSkew), UncondRing (Phase B), HitRates, Repacker.
+                      StreamBudget/StreamFlags are the setup; stream_buffer_type.cpp the ggml glue
+src/plan/ mem/ io/ calib/ report/ cache/ models/ config/ tools/   leaf modules
+```
+
+Only the engine touches the Streamer; the CLI and the server go through `engine::Engine`. The
+`--no-stream` reference path (`cli/cmd_run_reference.cpp`) deliberately keeps its own setup: it is the
+differential test's reference half and must not share the code it checks.
 
 ## Adding a model must be additive
 

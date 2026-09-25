@@ -67,9 +67,81 @@ set(LLAMA_CURL           OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
 
-# --- dray core -------------------------------------------------------------
-add_library(dray_core STATIC
-    # The Streamer: one owner per concern, composed in src/backend/streamer_impl.h.
+# --- dray modules ----------------------------------------------------------
+# One static library per concept, each linking ONLY what it uses, so the
+# dependency graph is declared here and a layering violation is a link error:
+#
+#   config  mem  io  models                  (leaves: depend on nothing of ours)
+#   plan        -> mem, ggml(gguf), llama(shard naming)
+#   report      -> plan
+#   calib       -> io, mem
+#   snapshot    -> mem, llama
+#   repack      -> plan
+#   stream      -> io, mem, plan, ggml        (the streaming engine)
+#   expertcache -> io, mem, plan              (legacy slab design; `stream` diagnostic only)
+#   engine      -> stream, plan, models, config, repack, llama
+#   server      -> engine, snapshot, httplib
+#   dray.exe -> all of the above
+#
+# Headers are still addressed as "module/file.h" from src/, so the graph is
+# enforced at link time, not at include time.
+function(dray_module name)
+    add_library(${name} STATIC ${ARGN})
+    target_compile_features(${name} PUBLIC cxx_std_20)
+    target_include_directories(${name} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if (WIN32)
+        target_compile_definitions(${name} PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+    endif()
+    if (MSVC)
+        target_compile_options(${name} PRIVATE /W4 /permissive- /Zc:preprocessor /utf-8)
+    else()
+        target_compile_options(${name} PRIVATE -Wall -Wextra)
+    endif()
+endfunction()
+
+dray_module(dray_config src/config/env_report.cpp)
+
+dray_module(dray_mem src/mem/accountant.cpp src/mem/pool_arena.cpp)
+
+# The thread pool is unconditional, NOT in the WIN32 branch: make_backend() falls
+# back to it on every platform, and on macOS it is the permanent answer.
+dray_module(dray_io src/io/storage.cpp src/io/storage_threadpool.cpp)
+if (WIN32)
+    target_sources(dray_io PRIVATE src/io/storage_win.cpp)
+elseif (APPLE)
+    target_sources(dray_io PRIVATE src/io/storage_mac.cpp)
+else()
+    target_sources(dray_io PRIVATE src/io/storage_linux.cpp)
+    include(CheckIncludeFile)
+    check_include_file("liburing.h" DRAY_HAVE_LIBURING_H)
+    if (DRAY_HAVE_LIBURING_H)
+        target_compile_definitions(dray_io PRIVATE DRAY_HAVE_URING=1)
+        target_link_libraries(dray_io PUBLIC uring)
+    else()
+        message(STATUS "liburing.h not found -- Linux runs on the thread pool")
+    endif()
+endif()
+
+dray_module(dray_models src/models/registry.cpp src/models/minimax_m3.cpp)
+
+dray_module(dray_plan src/plan/residency.cpp)
+target_link_libraries(dray_plan PUBLIC dray_mem PRIVATE ggml llama)
+
+dray_module(dray_report src/report/readout.cpp)
+target_link_libraries(dray_report PUBLIC dray_plan)
+
+dray_module(dray_calib src/calib/calibrate.cpp)
+target_link_libraries(dray_calib PUBLIC dray_io PRIVATE dray_mem)
+target_include_directories(dray_calib PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)  # json.hpp
+
+dray_module(dray_snapshot src/cache/snapshot_cache.cpp)
+target_link_libraries(dray_snapshot PUBLIC dray_mem llama)
+
+dray_module(dray_repack src/tools/repack.cpp)
+target_link_libraries(dray_repack PRIVATE dray_plan)
+target_include_directories(dray_repack PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)  # json.hpp
+
+dray_module(dray_stream
     src/backend/accounted_alloc.cpp
     src/backend/expert_compactor.cpp
     src/backend/expert_slots.cpp
@@ -85,71 +157,77 @@ add_library(dray_core STATIC
     src/backend/stream_buffer.cpp
     src/backend/stream_buffer_type.cpp
     src/backend/stream_flags.cpp
-    src/backend/uncond_ring.cpp
-    src/mem/accountant.cpp
-    src/mem/pool_arena.cpp
-    src/config/env_report.cpp
-    src/io/storage.cpp
-    # Unconditional, NOT in the WIN32 branch: make_backend() falls back to the
-    # thread-pool floor on every platform, and on macOS it is the permanent answer.
-    src/io/storage_threadpool.cpp
-    src/models/registry.cpp
-    src/models/minimax_m3.cpp
-    src/plan/residency.cpp
-    src/cache/expert_cache.cpp
-    src/cache/snapshot_cache.cpp
-    src/calib/calibrate.cpp
-    src/report/readout.cpp
-)
-
-target_compile_features(dray_core PUBLIC cxx_std_20)
-
-if (WIN32)
-    target_sources(dray_core PRIVATE src/io/storage_win.cpp)
-    target_compile_definitions(dray_core PUBLIC DRAY_WIN=1 NOMINMAX WIN32_LEAN_AND_MEAN)
-elseif (APPLE)
-    target_sources(dray_core PRIVATE src/io/storage_mac.cpp)
-    target_compile_definitions(dray_core PUBLIC DRAY_MAC=1)
-else()
-    target_sources(dray_core PRIVATE src/io/storage_linux.cpp)
-    target_compile_definitions(dray_core PUBLIC DRAY_LINUX=1)
-    include(CheckIncludeFile)
-    check_include_file("liburing.h" DRAY_HAVE_LIBURING_H)
-    if (DRAY_HAVE_LIBURING_H)
-        target_compile_definitions(dray_core PRIVATE DRAY_HAVE_URING=1)
-        target_link_libraries(dray_core PUBLIC uring)
-    else()
-        message(STATUS "liburing.h not found -- Linux runs on the thread pool")
-    endif()
-endif()
-
-target_include_directories(dray_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    src/backend/uncond_ring.cpp)
+target_link_libraries(dray_stream PUBLIC dray_io dray_mem dray_plan ggml)
 # ggml-backend-impl.h is private to ggml/src. Implementing a buffer type requires
 # it -- every in-tree ggml backend includes it the same way. This is a real
 # coupling to a non-public header and will break on upstream churn; that is the
 # price of streaming weights, and it is cheaper than forking the loader.
-target_include_directories(dray_core PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party)   # json.hpp (T5 calibration persistence)
-target_link_libraries(dray_core PUBLIC llama ggml)
+target_include_directories(dray_stream PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/src)
 
-if (MSVC)
-    target_compile_options(dray_core PRIVATE /W4 /permissive- /Zc:preprocessor /utf-8)
-else()
-    target_compile_options(dray_core PRIVATE -Wall -Wextra)
+dray_module(dray_expertcache src/cache/expert_cache.cpp)
+target_link_libraries(dray_expertcache PUBLIC dray_io dray_mem dray_plan)
+
+dray_module(dray_engine
+    src/engine/engine.cpp
+    src/engine/engine_setup.cpp
+    src/engine/batch_generator.cpp
+    src/engine/cohort_rotator.cpp
+    src/engine/streamed_text.cpp
+    src/engine/kv_overrides.cpp
+    src/engine/thread_policy.cpp)
+target_link_libraries(dray_engine
+    PUBLIC  llama
+    PRIVATE dray_stream dray_plan dray_mem dray_models dray_config dray_repack)
+
+dray_module(dray_server
+    src/server/serve.cpp
+    src/server/request_guard.cpp
+    src/server/chat_prompt.cpp
+    src/server/chat_completions.cpp
+    src/server/http_routes.cpp
+    src/server/job_registry.cpp
+    src/server/job_store.cpp
+    src/server/job_worker.cpp
+    src/server/shutdown.cpp)
+target_link_libraries(dray_server PUBLIC dray_engine PRIVATE dray_snapshot)
+target_include_directories(dray_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)  # httplib, json
+if (WIN32)
+    # httplib needs winsock; no TLS in v1, so ws2_32 alone suffices.
+    target_link_libraries(dray_server PRIVATE ws2_32)
 endif()
+
+# Everything, for consumers that exercise several modules at once (the tests).
+add_library(dray_core INTERFACE)
+target_link_libraries(dray_core INTERFACE
+    dray_config dray_mem dray_io dray_models dray_plan dray_report
+    dray_calib dray_snapshot dray_repack dray_stream dray_expertcache
+    dray_engine llama ggml)
 
 # --- cli ----------------------------------------------------------------------
 add_executable(dray
     src/main.cpp
-    src/server/engine.cpp
-    src/server/serve.cpp
-    src/tools/repack.cpp)
+    src/cli/args.cpp
+    src/cli/engine_config.cpp
+    src/cli/reference_read.cpp
+    src/cli/cmd_plan.cpp
+    src/cli/cmd_calibrate.cpp
+    src/cli/cmd_verify.cpp
+    src/cli/cmd_stream.cpp
+    src/cli/cmd_run.cpp
+    src/cli/cmd_run_reference.cpp
+    src/cli/cmd_batch.cpp
+    src/cli/cmd_snaptest.cpp
+    src/cli/cmd_serve.cpp
+    src/cli/cmd_repack.cpp)
 target_include_directories(dray PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-target_link_libraries(dray PRIVATE dray_core)
+target_link_libraries(dray PRIVATE
+    dray_server dray_engine dray_stream dray_expertcache dray_plan
+    dray_mem dray_io dray_calib dray_report dray_snapshot dray_repack
+    dray_config dray_models llama ggml)
 if (WIN32)
-    # httplib needs winsock; no TLS in v1, so ws2_32 alone suffices.
-    target_link_libraries(dray PRIVATE ws2_32)
+    target_compile_definitions(dray PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
 # --- tests --------------------------------------------------------------------

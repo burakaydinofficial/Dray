@@ -103,10 +103,11 @@ private:
 
     // The backend died with ring reads outstanding: the arena is still a DMA
     // target. Deactivating stops reuse -- the only reclaim site is gated on
-    // `active_`. KNOWN GAP (inherited, reviewer finding 2026-09-25): the dying
-    // segment's tags are cleared by settle(), so release_all() leaks the arena
-    // only if ANOTHER segment still has reads outstanding; otherwise it frees an
-    // arena the dead read may still be writing. Fix: remember the death here.
+    // `active_` -- and `died_` makes release_all() leak the arena. The death
+    // must be REMEMBERED: settle() clears the dying segment's tags, so at
+    // teardown that segment looks clean, and a ring whose only outstanding
+    // reads were the dead ones used to be freed under DMA (review finding,
+    // 2026-09-25).
     void retire_dead_ring();
 
     Parts          p_;
@@ -119,6 +120,7 @@ private:
     std::vector<ggml_tensor*> stream_list_;     // streamed uncond tensors, graph order
     size_t         cursor_ = 0;                 // modular over stream_list_
     bool           active_ = false;
+    bool           died_ = false;               // backend died under the ring
     std::vector<ggml_tensor*>        consumed_order_;
     std::unordered_set<ggml_tensor*> consumed_seen_;
     uint32_t       idle_backoff_ = 0;           // S22: sleeps after a fruitless lap

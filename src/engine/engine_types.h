@@ -1,10 +1,5 @@
-// The engine behind the server: one loaded model + streaming context, reused
-// across requests. This is cmd_run's setup sequence made reusable -- cmd_run
-// itself is deliberately untouched (it is the verified measurement path; the
-// two will be consolidated in a calm moment, not the night the server lands).
-//
-// Serialized admission is the caller's job (Invariant 7): generate() assumes one
-// generation at a time and the server holds a mutex across each request.
+// Plain data carried in and out of the engine: configuration, per-request
+// parameters, results and counters. No behaviour lives here.
 #pragma once
 
 #include <cstdint>
@@ -12,12 +7,7 @@
 #include <string>
 #include <vector>
 
-struct llama_model;
-struct llama_context;
-struct llama_vocab;
-namespace dray::mem { class Accountant; }
-
-namespace dray::server {
+namespace dray::engine {
 
 struct EngineConfig {
     std::string model_path;
@@ -54,23 +44,16 @@ struct EngineConfig {
     // correctness gates must be able to pin the streaming path or they
     // silently stop testing this engine at all.
     bool force_stream = false;
-    // --resident: hand allocation to llama when the model fits (EXPERIMENTAL,
-    // currently produces wrong output -- see DECISIONS). Intended to become
-    // the default once a correctness gate covers it.
+    // --resident: accepted for compatibility and otherwise unused. Resident
+    // mode (llama allocates the model when it fits the cache budget) is the
+    // DEFAULT since 2026-08-22, gated by scripts/residenttest.ps1; only
+    // --force-stream changes the decision.
     bool resident = false;
     // KV cache quantization (--kv q4|q8|f16, default f16). Quality is
     // model-dependent and never assumed (Invariant 8): the owner measured
     // q4/q4 as near-lossless on Qwen3.8-27B; other models unmeasured.
     std::string kv_quant;
 };
-
-struct Engine;  // owns accountant, streamer, plan, metadata, model, context
-
-// Opens the full streaming stack. On failure returns nullptr and sets *err.
-// Prints the plan and integrity report to stderr exactly like cmd_run, because
-// the operator of a server deserves the same honesty as the operator of a run.
-Engine* engine_open(const EngineConfig& cfg, std::string* err);
-void    engine_close(Engine* e);
 
 struct GenParams {
     std::string prompt;
@@ -136,23 +119,8 @@ struct GenResult {
     std::string error;                 // non-empty = request failed outright
 };
 
-// Runs one generation. token_cb (may be null) receives each detokenized piece as
-// it is produced -- the streaming hook. Clears the model memory (KV/recurrent)
-// first: requests are independent in v1; prefix reuse is a later feature.
-GenResult engine_generate(Engine* e, const GenParams& p,
-                          const std::function<void(const std::string&)>& token_cb);
-
-// The raw context and vocab, for the persistence layer and its diagnostics:
-// capture/restore work BETWEEN decodes on the live context by design.
-struct llama_context* engine_ctx(Engine* e);
-const llama_vocab*    engine_vocab(Engine* e);
-// The model handle, for chat-template application in the server layer.
-const llama_model* engine_model(Engine* e);
-
 // Structured live counters for readouts and /health: byte totals by class,
 // node count, failures, ledger-resident bytes, and the cap-honesty verdict.
-// Read these only when no generation is running (or from the generating
-// thread itself): the underlying counters are plain integers by design.
 struct EngineCounters {
     uint64_t bytes_streamed = 0;   // total from disk
     uint64_t bytes_gather = 0;     // routed-expert share of the total
@@ -166,29 +134,7 @@ struct EngineCounters {
     uint64_t resident_bytes = 0;   // accountant ledger, used()
     bool     over_cap = false;
 };
-EngineCounters engine_counters(Engine* e);
-std::string engine_accountant_report(Engine* e);
-// T6: for wiring SnapshotCache's ledger; checkpoint blobs must not bypass the cap.
-dray::mem::Accountant* engine_accountant(Engine* e);
-// G1: bytes of the standing checkpoint allowance (0 = none reserved).
-uint64_t engine_checkpoint_allowance(Engine* e);
-// T13: lock-free live generation state, safe from any thread at any time.
-int32_t engine_live_tokens(Engine* e);
-bool engine_live_over_cap(Engine* e);
-std::string engine_plan_report(Engine* e);
-// The streamer's honest report line, for /health.
-std::string engine_report(Engine* e);
-// Model identity for /v1/models.
-std::string engine_model_id(Engine* e);
-// True if any weight ever failed to materialise (output untrustworthy).
-bool engine_tainted(Engine* e);
-uint64_t engine_failures(Engine* e);
 
-// Blocking server loop. Returns process exit code.
-int serve_main(const EngineConfig& cfg, int port, const std::string& jobs_dir,
-               const std::string& api_key = std::string());
-
-// ---------------------------------------------------------------------------
 // Batched decode (offline; owner-mandated production batching, phase 2).
 // N sequences decoded in LOCKSTEP through the same streamer: the unconditional
 // stream is read once per step for all of them, routed experts once per step
@@ -216,7 +162,6 @@ struct BatchResult {
     uint64_t prefill_end_bytes = 0;
     std::string error;             // batch-level failure (admission, decode)
 };
-BatchResult engine_generate_batch(Engine* e, const BatchParams& p);
 
 // Cohort rotation (owner-ratified 2026-08-19): more logical sequences than
 // the admission funds, served by rotating cohorts of the funded width. A
@@ -239,6 +184,7 @@ struct RotateParams {
     std::function<bool()> should_continue;
     std::function<void(int32_t round, int32_t cohort, int32_t done)> on_round;
 };
+
 struct RotateResult {
     std::vector<GenResult> seqs;        // one per prompt, same order
     uint64_t rounds = 0;                // cohort residencies executed
@@ -246,6 +192,5 @@ struct RotateResult {
     uint64_t state_bytes_read = 0;
     std::string error;
 };
-RotateResult engine_generate_rotated(Engine* e, const RotateParams& p);
 
-}  // namespace dray::server
+}  // namespace dray::engine

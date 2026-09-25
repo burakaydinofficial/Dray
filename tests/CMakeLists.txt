@@ -71,6 +71,8 @@ dray_add_test(compaction)
 # The streamer's sizing arithmetic (churn, ring, eslot pool, sentinel), which
 # until 2026-09-25 could only be checked by loading a model.
 dray_add_test(stream_budget)
+# Stop sequences on every path: the one find_stop() rule and StreamedText.
+dray_add_test(stop_match)
 
 # The snapshot cache had no header when these tests were written (the root
 # CMakeLists.txt lists src/cache/snapshot_cache.cpp, but src/cache/ was empty).
