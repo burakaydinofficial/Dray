@@ -77,7 +77,6 @@ add_library(dray_core STATIC
     # Unconditional, NOT in the WIN32 branch: make_backend() falls back to the
     # thread-pool floor on every platform, and on macOS it is the permanent answer.
     src/io/storage_threadpool.cpp
-    src/sched/prefetch.cpp
     src/models/registry.cpp
     src/models/minimax_m3.cpp
     src/plan/residency.cpp

@@ -167,15 +167,6 @@ struct Streamer::Impl {
     // Widest single batched union region (uniq(n_seq) x slot): the measured
     // admission floor. Certain death below 1x (B=38), proven clean at 2x (B=32).
     uint64_t batch_region_bound = 0;
-    // Speculative reads are capped explicitly, not just checked against the budget.
-    //
-    // Three claimants share the budget: statically pinned tensors, in-flight
-    // prefetch, and the working set of the node being computed. Only the last one
-    // MUST succeed, and it is the only one that cannot wait. Prefetch memory is not
-    // in the LRU, so make_room cannot reclaim it -- an unbounded prefetch therefore
-    // starves the node it exists to help, which is exactly what happened.
-    uint64_t inflight_bytes = 0;
-    uint64_t inflight_cap = 0;
 
     // Per ids-tensor state for expert compaction.
     //
@@ -366,43 +357,26 @@ struct Streamer::Impl {
     uint64_t emergency_bytes = 0;
     uint64_t scratch_bytes = 0;
 
-    // PREFETCH.
-    //
-    // Reading a tensor and then computing with it leaves the drive idle for the
-    // whole compute step: 206 GB moved in 126 s is 1.63 GB/s against a calibrated
-    // 6.63, and the gap is not queue depth inside a read, it is the absence of any
-    // overlap between reading and computing.
-    //
-    // Weight access is almost perfectly predictable -- the graph sweeps layers in
-    // order, and every unconditional weight is touched once per token -- so the
-    // next tensors can be read while the current node computes. `order` is the
-    // sequence tensors were created in, which is model build order, i.e. layer
-    // order; `cursor` is how far the current node has got through it.
     // Tensor names that arrived with no disk source, reported once each. See
     // init_tensor: a real weight here is uninitialised memory, not a curiosity.
     std::set<std::string> unsourced;
 
-    std::vector<ggml_tensor*> order;
-    size_t cursor = 0;
-    uint64_t prefetch_hits = 0;    // needed and already in flight or resident
-    uint64_t prefetch_issued = 0;
-
     // ONE registry for every read in flight, keyed by a globally unique tag.
     //
-    // Prefetch and batched expert reads share a single completion queue, so they
-    // must share a single tag space. An earlier version had batch reads tag
-    // requests 0,1,2... and treat a completion's tag as an index into their own
-    // array, while prefetch used a global counter: a prefetch completion arriving
-    // during a batch poll was consumed as if it were a batch entry, and the waiter
-    // for it then blocked forever. Low CPU, low disk, no progress.
+    // Every reader -- batched expert reads, sibling regions, the ring, direct
+    // whole-tensor reads -- shares a single completion queue, so they must share a
+    // single tag space. An earlier version had batch reads tag requests 0,1,2...
+    // and treat a completion's tag as an index into their own array, while the
+    // (since removed) per-tensor prefetch used a global counter: a prefetch
+    // completion arriving during a batch poll was consumed as if it were a batch
+    // entry, and the waiter for it then blocked forever. Low CPU, low disk, no
+    // progress.
     struct InFlight {
         uint8_t* stage = nullptr;
         uint64_t head = 0;
         uint32_t span = 0;
-        void*    mem = nullptr;    // destination: slot for prefetch, caller's for batch
+        void*    mem = nullptr;    // destination the staged bytes are copied to
         uint64_t bytes = 0;
-        bool     prefetch = false; // prefetch entries become resident on settle
-        const ggml_tensor* owner = nullptr;   // prefetch only
         bool     done = false;
         bool     ok = false;
         uint64_t got = 0;      // bytes the device actually returned
@@ -412,7 +386,6 @@ struct Streamer::Impl {
         int      status = 0;
     };
     std::unordered_map<uint64_t, InFlight> pending;          // by tag
-    std::unordered_map<const ggml_tensor*, uint64_t> prefetch_tag;
     uint64_t next_tag = 1;
 
     // Weights the node currently being computed depends on. Never evicted while
@@ -624,10 +597,6 @@ static enum ggml_status dray_buffer_init_tensor(ggml_backend_buffer_t buf, ggml_
         im->resident[t] = r;
         return GGML_STATUS_SUCCESS;
     }
-
-    // Record creation order. llama.cpp builds tensors layer by layer, so this is
-    // the order the graph will want them in, which is what prefetch walks ahead of.
-    im->order.push_back(t);
 
     // Streamed: no storage now, and none until the node that needs it runs.
     //
@@ -895,10 +864,6 @@ Streamer::Streamer(mem::Accountant& acct, const plan::Plan& p, Config cfg)
     churn = std::max(churn, widest_whole + (widest_whole / 4));   // + headroom
 
     im.churn_reserve = churn;
-    // Prefetch gets a slice of the churn reserve, never all of it: whatever it
-    // holds is unreclaimable until its read lands, so the rest must stay free for
-    // the node being computed.
-    im.inflight_cap = churn / 2;
 
     // PHASE B ring: an accounted, fixed line item -- never carved from the cache at
     // runtime, which is what killed the first prefetch. Default 2x the widest whole
@@ -982,10 +947,18 @@ Streamer::Streamer(mem::Accountant& acct, const plan::Plan& p, Config cfg)
         }
     }
     // Static pinning takes everything except the current layer's reserve. It does
-    // NOT set aside room for prefetch: doing so cost 1.3 GB of pinning and made the
-    // run slower on both time and bytes (see start_prefetch). Pinning wins below the
-    // knee; prefetch gets whatever genuinely remains free, which is little here and
-    // a lot once the cap clears the knee.
+    // NOT set aside room for speculative reads. The per-tensor prefetch that
+    // preceded the ring (replaced in 89cfcdc, deleted later) measured why, on
+    // Qwen3.8 UD-IQ1_S at 12 GiB, 4 tokens:
+    //
+    //   batched only             31.5 s/tok   206.3 GB
+    //   + prefetch, no evict     35.2 s/tok   208.8 GB   304/304 hits
+    //   + prefetch, may evict    36.7 s/tok   211.5 GB   673/673 hits
+    //
+    // A perfect hit rate that loses on BOTH axes: every byte a speculative read
+    // holds is a byte not pinned, re-read every token. Below the knee holding a
+    // byte beats overlapping a read. The ring gets its own accounted line item
+    // above instead of competing with pinning at runtime.
     // static_allowance() derives from the same ledger; nothing to assign here.
 
     im.buft.iface.get_name       = dray_buft_name;
@@ -1179,8 +1152,7 @@ static size_t pump(Streamer::Impl& im, size_t min_complete) {
 }
 
 // Registers one read and submits it. Returns 0 if it could not be started.
-static uint64_t submit_one(Streamer::Impl& im, const Source& s, void* dst, uint64_t bytes,
-                           bool prefetch, const ggml_tensor* owner) {
+static uint64_t submit_one(Streamer::Impl& im, const Source& s, void* dst, uint64_t bytes) {
     if (s.shard < 0 || static_cast<size_t>(s.shard) >= im.shards.size()) return 0;
     const io::FileId f = im.shards[static_cast<size_t>(s.shard)];
     const io::Alignment al = im.io->alignment(f);
@@ -1243,7 +1215,7 @@ static uint64_t submit_one(Streamer::Impl& im, const Source& s, void* dst, uint6
     }
 
     im.pending[tag] = {stage, head, static_cast<uint32_t>(span), dst, bytes,
-                       prefetch, owner, false, false, 0,
+                       false, false, 0,
                        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                            std::chrono::steady_clock::now().time_since_epoch()).count()};
     return tag;
@@ -1275,7 +1247,7 @@ static bool read_batch(Streamer::Impl& im, const std::vector<Slice>& slices) {
             if (pump(im, 1) == 0) { failed = true; break; }
         }
         if (failed) break;
-        const uint64_t tag = submit_one(im, sl.src, sl.dst, sl.len, false, nullptr);
+        const uint64_t tag = submit_one(im, sl.src, sl.dst, sl.len);
         if (tag == 0) { failed = true; break; }
         tags.push_back(tag);
     }
@@ -1370,7 +1342,7 @@ static void* alloc_and_read_direct(Streamer::Impl& im, mem::Category cat,
         io::ReadRequest r{f, lo, static_cast<uint32_t>(span), base, tag};
         // stage and mem both null: pump has nothing to copy, discard nothing to free.
         im.pending[tag] = {nullptr, head, static_cast<uint32_t>(span),
-                           nullptr, bytes, false, nullptr, false, false};
+                           nullptr, bytes, false, false};
         if (im.io->submit(&r, 1) == 1) break;
         im.pending.erase(tag);
         tag = 0;
@@ -1452,86 +1424,6 @@ static bool make_room(Streamer::Impl& im, uint64_t need) {
     }
     }
     return cache_used(im) + need <= cache_budget(im);
-}
-
-// Waits for a specific prefetched tensor, then turns it into a resident entry.
-static bool settle_prefetch(Streamer::Impl& im, ggml_tensor* t) {
-    auto pt = im.prefetch_tag.find(t);
-    if (pt == im.prefetch_tag.end()) return false;
-    const uint64_t tag = pt->second;
-
-    for (;;) {
-        auto it = im.pending.find(tag);
-        if (it == im.pending.end()) { im.prefetch_tag.erase(pt); return false; }
-        if (it->second.done) break;
-        if (pump(im, 1) == 0) { it->second.done = true; it->second.ok = false; break; }
-    }
-
-    auto it = im.pending.find(tag);
-    const bool ok = it != im.pending.end() && it->second.ok;
-    void* mem = (it != im.pending.end()) ? it->second.mem : nullptr;
-    const uint64_t bytes = (it != im.pending.end()) ? it->second.bytes : 0;
-    discard(im, tag);
-    im.prefetch_tag.erase(pt);
-    im.inflight_bytes -= std::min(im.inflight_bytes, bytes);
-
-    if (!ok) {
-        if (mem) { free_acct(im, mem::Category::ExpertCache, mem, bytes); }
-        t->data = poison_for(im, t);
-        return false;
-    }
-    Resident nr; nr.mem = mem; nr.bytes = bytes; nr.pinned = false;
-    nr.prio = Prio::Unconditional;
-    if (im.static_used + bytes <= static_allowance(im)) {
-        nr.pinned = true;
-        im.static_used += bytes;
-    }
-    t->data = mem;
-    nr.repacked = maybe_repack(im, t);
-    im.resident[t] = nr;
-    im.lru.push_front(t);
-    return true;
-}
-
-// Starts a read for `t` without waiting. Returns false if it could not be started,
-// which is not an error -- the tensor is simply read synchronously when needed.
-static bool start_prefetch(Streamer::Impl& im, ggml_tensor* t) {
-    if (!t || im.resident.count(t) || im.prefetch_tag.count(t)) return false;
-    auto b = im.bound.find(t);
-    if (b == im.bound.end()) return false;
-    if (im.io->in_flight() >= im.io->max_in_flight()) return false;
-
-    const uint64_t bytes = ggml_nbytes(t);
-
-    // PREFETCH NEVER EVICTS, which makes it inactive below the knee. Measured, not
-    // assumed. Qwen3.8 UD-IQ1_S, 12 GiB cap, 4 tokens:
-    //
-    //   batched only             31.5 s/tok   206.3 GB
-    //   + prefetch, no evict     35.2 s/tok   208.8 GB   304/304 hits
-    //   + prefetch, may evict    36.7 s/tok   211.5 GB   673/673 hits
-    //
-    // The hit rate is perfect and it loses on BOTH axes. Every byte prefetch holds
-    // is a byte not permanently pinned, and the +5.2 GB matches exactly the 1.3 GB
-    // of lost pinning re-read across 4 tokens. Below the knee the cache is far
-    // smaller than the working set, so there is no cold data to displace: holding a
-    // byte beats overlapping a read.
-    //
-    // The mechanism stays because it is correct and costs nothing when it cannot
-    // run: above the knee, where slack exists, it should pay. It self-limits --
-    // this guard is simply unsatisfiable while the cache is saturated.
-    if (cache_used(im) + bytes + im.churn_reserve > cache_budget(im)) return false;
-    if (im.inflight_bytes + bytes > im.inflight_cap) return false;
-
-    void* mem = alloc_acct(im, mem::Category::ExpertCache, bytes, kBufAlign);
-    if (!mem) return false;
-
-    const uint64_t tag = submit_one(im, b->second, mem, bytes, true, t);
-    if (tag == 0) { free_acct(im, mem::Category::ExpertCache, mem, bytes); return false; }
-
-    im.inflight_bytes += bytes;
-    im.prefetch_tag[t] = tag;
-    ++im.prefetch_issued;
-    return true;
 }
 
 // Everything the ring will stream, in graph order: bound, not floor, not
@@ -1688,8 +1580,7 @@ static void pump_ring(Streamer::Impl& im) {
                 off >= interior ? 0 : std::min<uint64_t>(clen, interior - off);
             const uint64_t tag = im.next_tag++;
             io::ReadRequest r{f, lo + off, clen, im.ring + sg.pos + off, tag};
-            im.pending[tag] = {nullptr, 0, clen, nullptr, need, false, nullptr,
-                               false, false};
+            im.pending[tag] = {nullptr, 0, clen, nullptr, need, false, false};
             if (im.io->submit(&r, 1) != 1) { im.pending.erase(tag); fail = true; sg.complete = false; }
             else sg.tags.push_back(tag);
         }
@@ -1810,14 +1701,6 @@ static bool bring_in(Streamer::Impl& im, ggml_tensor* t, uint64_t* streamed) {
         else              im.uncond_needed += ggml_nbytes(t);   // served from RAM: read 0
         return true;
     }
-    // Already being read by prefetch: wait for that read rather than starting a
-    // second one. This is where the overlap pays off -- by now it has usually
-    // landed while an earlier node was computing.
-    if (im.prefetch_tag.count(t)) {
-        ++im.prefetch_hits;
-        if (settle_prefetch(im, t)) { *streamed += ggml_nbytes(t); return true; }
-        return false;
-    }
     // The ring: by now the bytes are usually already in the arena, and this is a
     // pointer assignment. On failure fall through to the synchronous read.
     if (ring_consume(im, t, streamed)) return true;
@@ -1842,15 +1725,6 @@ static bool bring_in(Streamer::Impl& im, ggml_tensor* t, uint64_t* streamed) {
         return false;
     };
 
-    // Before giving up, settle anything prefetch is holding: its memory is
-    // unreclaimable while in flight, but once landed it becomes ordinary resident
-    // memory that make_room can evict. The node being computed always wins.
-    if (!make_room(im, bytes) && !im.prefetch_tag.empty()) {
-        std::vector<ggml_tensor*> waiting;
-        waiting.reserve(im.prefetch_tag.size());
-        for (const auto& kv : im.prefetch_tag) waiting.push_back(const_cast<ggml_tensor*>(kv.first));
-        for (ggml_tensor* w : waiting) settle_prefetch(im, w);
-    }
     if (!make_room(im, bytes)) return fail("no room");
     uint64_t alloc_bytes = 0;
     uint32_t head = 0;
@@ -2295,7 +2169,7 @@ static void submit_sibling_region(Streamer::Impl& im, ggml_tensor* w,
             if (pump(im, 1) == 0) { fail = true; break; }
         }
         if (fail) break;
-        const uint64_t tag = submit_one(im, s, mem + k * stride, stride, false, nullptr);
+        const uint64_t tag = submit_one(im, s, mem + k * stride, stride);
         if (tag == 0) { fail = true; break; }
         pr.tags.push_back(tag);
     }
@@ -3157,7 +3031,6 @@ std::string Streamer::report() const {
       << (cache_used(im) / 1e9) << " GB, " << im.resident.size() << " tensors resident, "
       << (bytes_streamed_ / 1e9) << " GB streamed over " << nodes_ << " nodes, "
       << im.compacted << " expert-compacted, "
-      << im.prefetch_hits << "/" << im.prefetch_issued << " prefetch hit, "
       << "pool " << (im.pool.enabled() ? im.pool.committed() / 1e9 : -1.0) << " GB committed "
       << im.pool.fallbacks() << " fallbacks, "
       << im.ring_hits << " ring-fed (front="
