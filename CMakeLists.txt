@@ -69,7 +69,23 @@ add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
 
 # --- dray core -------------------------------------------------------------
 add_library(dray_core STATIC
+    # The Streamer: one owner per concern, composed in src/backend/streamer_impl.h.
+    src/backend/accounted_alloc.cpp
+    src/backend/expert_compactor.cpp
+    src/backend/expert_slots.cpp
+    src/backend/hit_rates.cpp
+    src/backend/io_scheduler.cpp
+    src/backend/merged_metadata.cpp
+    src/backend/poison_buffers.cpp
+    src/backend/private_ids.cpp
+    src/backend/repacker.cpp
+    src/backend/residency_cache.cpp
+    src/backend/routing_skew.cpp
+    src/backend/stream_budget.cpp
     src/backend/stream_buffer.cpp
+    src/backend/stream_buffer_type.cpp
+    src/backend/stream_flags.cpp
+    src/backend/uncond_ring.cpp
     src/mem/accountant.cpp
     src/mem/pool_arena.cpp
     src/config/env_report.cpp

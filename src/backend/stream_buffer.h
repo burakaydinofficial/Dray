@@ -32,11 +32,16 @@
 //      tensors (the floor) are pinned and skip this entirely.
 //
 // MUL_MAT_ID. A layer's experts are one fused tensor indexed by uniform stride, so
-// a partially-resident tensor cannot be expressed by repointing data. Two options,
-// both live: materialise only the selected experts into a compact slot region and
-// rewrite the ids (needs the ids readable at compute time, which they are, since
-// the router ran earlier in the same graph); or decompose the op into per-expert
-// mul_mat. The first is cheaper and is what the ExpertCache slab already produces.
+// a partially-resident tensor cannot be expressed by repointing data. Only the
+// selected experts are read, into one compact region at the tensor's own stride,
+// and the node gets private remapped ids (expert_compactor.h, private_ids.h).
+//
+// WHERE THINGS LIVE. This header is the whole public surface. Behind it,
+// streamer_impl.h composes the parts: accounted_alloc, poison_buffers,
+// io_scheduler, tensor_registry, residency_cache, expert_compactor,
+// expert_slots + routing_skew, uncond_ring, hit_rates, repacker, private_ids;
+// stream_budget and stream_flags are the setup they are built from, and
+// stream_buffer_type.cpp is the ggml callback glue.
 
 #pragma once
 
@@ -45,6 +50,8 @@
 #include <string>
 #include <vector>
 
+#include "backend/merged_metadata.h"
+#include "backend/tensor_source.h"
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "io/storage.h"
@@ -52,25 +59,6 @@
 #include "plan/residency.h"
 
 namespace dray::backend {
-
-// Where a tensor's bytes actually live. Filled from the Plan at init_tensor time,
-// never from the bytes llama.cpp offers us.
-struct Source {
-    int32_t  shard = -1;
-    uint64_t offset = 0;   // within its shard
-    uint64_t bytes = 0;
-    bool     pinned = false;  // part of the mandatory floor: resident for the run
-    // Kept so the floor can be charged to the right ledger category (router gates
-    // are 1.5-2.4 GB on these models -- a user who cannot see that in the startup
-    // report will think the cache is broken).
-    bool     is_router_gate = false;
-    uint64_t disk_stride = 0;  // repacked companion: per-expert stride on DISK
-    // True when this tensor is never materialised WHOLE: routed experts go through
-    // MUL_MAT_ID compaction, the token embedding through GET_ROWS row slicing. Only
-    // the rest set the floor under a workable cache size.
-    bool     sliceable = false;
-    bool     routed = false;   // I2: expert-fused; whole only under NO_COMPACT
-};
 
 struct Config {
     uint64_t cap = 0;             // total resident bytes (Invariant 1)
@@ -216,28 +204,5 @@ private:
     uint64_t bytes_streamed_ = 0;
     uint64_t nodes_ = 0;
 };
-
-// Builds one gguf_context describing EVERY tensor across every shard, so the model
-// can be created with llama_model_init_from_user instead of being loaded from file.
-//
-// Why: llama_model_loader::load_all_data returns immediately when `files` is empty,
-// calling only the set_tensor_data callback. init_from_user takes that path, so
-// nothing is read at load. Otherwise llama.cpp reads all 508 GB into a landing
-// buffer we then discard -- minutes of pure waste per start, and worse, the landing
-// buffer must be as large as the biggest tensor (1.6 GiB on Qwen3.8), which at a
-// 4 GiB cap consumes the entire budget before a single weight is cached.
-//
-// The returned gguf_context and ggml_context are owned by the caller. `split.*`
-// keys are dropped so llama.cpp does not go looking for shards it will never read.
-struct MergedMetadata {
-    // Qualified: a bare `struct gguf_context*` here would declare a NEW type inside
-    // this namespace rather than referring to ggml's.
-    ::gguf_context* gguf = nullptr;
-    ::ggml_context* ctx  = nullptr;
-    int64_t n_tensors = 0;
-};
-
-MergedMetadata merge_shard_metadata(const plan::Plan&, std::string* error);
-void free_merged_metadata(MergedMetadata&);
 
 }  // namespace dray::backend
