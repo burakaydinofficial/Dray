@@ -30,6 +30,7 @@ StreamFlags StreamFlags::from_env() {
     f.trace         = on("DRAY_TRACE");
     f.trace_compact = on("DRAY_TRACE_COMPACT");
     f.io_stats      = on("DRAY_IO_STATS");
+    if (const char* v = std::getenv("DRAY_IO_THREAD")) f.io_thread = v[0] != '0';
     if (const char* v = std::getenv("DRAY_RING_MB")) {
         f.ring_mb = std::strtoull(v, nullptr, 10);
     }

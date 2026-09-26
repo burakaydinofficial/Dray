@@ -71,7 +71,7 @@ $levers = [ordered]@{
     "lv_noreuse" = @{ NO_REUSE = "1" };    "lv_compactall" = @{ COMPACT_ALL = "1" }
     "lv_norowslice" = @{ NO_ROWSLICE = "1" }; "lv_fastnodes" = @{ FAST_NODES = "1" }
     "lv_noring" = @{ RING_MB = "0" };      "lv_nopool" = @{ NO_POOL = "1" }
-    "lv_repack" = @{ REPACK = "1" }
+    "lv_repack" = @{ REPACK = "1" };        "lv_noiothread" = @{ IO_THREAD = "0" }
 }
 foreach ($ln in $levers.Keys) {
     $e = @{}; foreach ($k in $levers[$ln].Keys) { $e["$EnvPrefix$k"] = $levers[$ln][$k] }

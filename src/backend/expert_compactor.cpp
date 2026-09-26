@@ -114,7 +114,6 @@ void ExpertCompactor::submit_sibling_region(ggml_tensor* w, const std::vector<in
         Source s = *src;
         s.offset += static_cast<uint64_t>(uniq[k]) *
                     (s.disk_stride ? s.disk_stride : stride);
-        if (!p_.io.wait_for_slot()) { fail = true; break; }
         const uint64_t tag = p_.io.submit_staged(s, mem + k * stride, stride);
         if (tag == 0) { fail = true; break; }
         pr.tags.push_back(tag);

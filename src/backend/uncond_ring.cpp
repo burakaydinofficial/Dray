@@ -98,22 +98,24 @@ void UncondRing::produce() {
     }
     if (stream_list_.empty()) return;
 
-    // Leave depth for unlock-triggered expert batches: they have the nearest
-    // deadline and must not queue behind the speculative stream.
+    // Bound the read-ahead in chunks, counted HERE: chunks enqueued and not yet
+    // settled by the consumer. It used to be the backend's in-flight count,
+    // which moves with harvest timing and so made production -- and through
+    // retention, residency and bytes -- depend on when completions happened to
+    // be polled. This count moves only at production and consumption, so the
+    // schedule is a function of the graph alone. (The old check never fired in
+    // any measured run; the arena fills first. Expert batches no longer need
+    // depth left for them: the scheduler submits urgent reads before ring reads.)
     const size_t cap_depth = p_.io.max_in_flight();
     const size_t depth_target = cap_depth > 16 ? cap_depth - 16 : cap_depth;
 
     size_t guard = 0;
     bool did_work = false;
     while (guard++ < stream_list_.size()) {
-        // HARVEST FIRST, non-blocking. An op counts as in-flight until polled, so
-        // without this the depth check saturates after the first top-up and never
-        // clears: measured 64 ring-fed across 8 tokens -- ~6-8 segments (48 chunks)
-        // per token, then every pump broke on depth for the rest of the pass while
-        // the drive sat idle. Harvesting here is what turns the thousands of
-        // callbacks per layer into a continuously refilled window.
-        p_.io.pump(0);
-        if (p_.io.in_flight() >= depth_target) { ++stop_[0]; break; }
+        // Give the scheduler the CPU first: it refills the device and routes any
+        // completions, so the ring's window keeps moving between callbacks.
+        p_.io.kick();
+        if (live_chunks_ >= depth_target) { ++stop_[0]; break; }
         ggml_tensor* t = stream_list_[cursor_ % stream_list_.size()];
 
         // A full lap: the next tensor is already queued and unconsumed. Deep enough.
@@ -164,11 +166,12 @@ void UncondRing::produce() {
             // legally come up short.
             const uint64_t need =
                 off >= interior ? 0 : std::min<uint64_t>(clen, interior - off);
-            const uint64_t tag =
-                p_.io.submit_unstaged(f, lo + off, clen, arena_ + sg.pos + off, 0, need);
+            const uint64_t tag = p_.io.submit_unstaged(f, lo + off, clen, arena_ + sg.pos + off,
+                                                       0, need, IoPriority::Background);
             if (tag == 0) { fail = true; sg.complete = false; }
             else sg.tags.push_back(tag);
         }
+        live_chunks_ += sg.tags.size();
         if (fail && sg.tags.empty()) { ++stop_[4]; break; }
         used_ += span;
         head_off_ = (head_off_ + span) % bytes_;
@@ -199,7 +202,7 @@ bool UncondRing::consume(ggml_tensor* t, uint64_t* streamed) {
         // letting the producer recycle a segment the kernel could still write
         // (2026-08-24 audit).
         bool dead = false;
-        const bool settled_ok = p_.io.settle(sg.tags, &dead);
+        const bool settled_ok = settle_segment(sg, &dead);
         if (dead) retire_dead_ring();
         const bool ok = settled_ok && sg.complete;
         sg.consumed = true;
@@ -228,12 +231,17 @@ void UncondRing::retire_pending(ggml_tensor* t) {
             // retire the ring, not just this segment: outstanding DMA does not
             // care which segment the caller was touching.
             bool dead = false;
-            if (!p_.io.settle(sg.tags, &dead)) sg.reads_ok = false;
+            if (!settle_segment(sg, &dead)) sg.reads_ok = false;
             if (dead) retire_dead_ring();
             sg.consumed = true;
             break;
         }
     }
+}
+
+bool UncondRing::settle_segment(Segment& sg, bool* dead) {
+    live_chunks_ -= sg.tags.size();   // settle() clears the tags either way
+    return p_.io.settle(sg.tags, dead);
 }
 
 void UncondRing::retire_dead_ring() {
@@ -258,7 +266,7 @@ void UncondRing::release_all() {
     bool dead = false;
     for (auto& sg : queue_) {
         bool d1 = false;
-        p_.io.settle(sg.tags, &d1);
+        settle_segment(sg, &d1);
         dead = dead || d1;
     }
     queue_.clear();

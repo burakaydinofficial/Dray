@@ -39,6 +39,10 @@ struct StreamFlags {
     bool trace_compact = false; // DRAY_TRACE_COMPACT  compaction and private-ids checks
     bool io_stats      = false; // DRAY_IO_STATS       I/O forensics in the report
 
+    // The I/O thread. ON unless DRAY_IO_THREAD=0, which keeps the service
+    // loop on the compute thread (the pre-thread behaviour, for bisecting).
+    bool io_thread     = true;
+
     // DRAY_RING_MB: ring size override. Set-but-empty is a value (0 MiB, i.e.
     // no ring), not "unset" -- that is how the variable has always read.
     std::optional<uint64_t> ring_mb;

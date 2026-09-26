@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <system_error>
 
 namespace dray::backend {
 
@@ -18,12 +19,19 @@ uint64_t ns_since(std::chrono::steady_clock::time_point t0) {
         std::chrono::steady_clock::now() - t0).count();
 }
 
+void log_leak(size_t n) {
+    std::fprintf(stderr,
+                 "[dray] FATAL: backend dead with reads outstanding; "
+                 "leaking %zu staging buffers (no-cancel contract)\n", n);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // lifetime
 
 IoScheduler::~IoScheduler() {
+    stop_thread();
     if (io_) {
         for (io::FileId f : shards_) io_->close(f);
     }
@@ -31,7 +39,12 @@ IoScheduler::~IoScheduler() {
 
 bool IoScheduler::open(const std::vector<std::string>& shard_paths, uint32_t queue_depth,
                        std::string* error) {
-    io_ = io::make_backend(queue_depth);
+    return open_with(io::make_backend(queue_depth), shard_paths, error);
+}
+
+bool IoScheduler::open_with(std::unique_ptr<io::Backend> backend,
+                            const std::vector<std::string>& shard_paths, std::string* error) {
+    io_ = std::move(backend);
     if (!io_) { *error = "no storage backend"; return false; }
 
     for (const std::string& sp : shard_paths) {
@@ -52,15 +65,94 @@ bool IoScheduler::open(const std::vector<std::string>& shard_paths, uint32_t que
     return true;
 }
 
+void IoScheduler::start_thread() {
+    if (threaded_ || start_tried_ || !io_) return;
+    start_tried_ = true;   // once: a failed attempt is not retried on every node
+    try {
+        worker_ = std::thread([this] { run(); });
+        threaded_ = true;
+    } catch (const std::system_error&) {
+        // No thread: the compute thread keeps servicing the queue, as before.
+    }
+}
+
+void IoScheduler::stop_thread() {
+    if (!threaded_) return;
+    {
+        Lock lk(m_);
+        stop_ = true;
+    }
+    work_cv_.notify_all();
+    worker_.join();
+    threaded_ = false;
+}
+
 std::string IoScheduler::describe() const {
     return io_ ? io_->describe() : std::string("no backend");
 }
 
-// ---------------------------------------------------------------------------
-// completions
+size_t IoScheduler::in_flight() const {
+    Lock lk(m_);
+    return submitted_;
+}
 
-size_t IoScheduler::pump(size_t min_complete) {
-    if (io_->in_flight() == 0) return 0;
+IoStats IoScheduler::stats() const {
+    Lock lk(m_);
+    IoStats s = stats_;
+    s.threaded = threaded_;
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// the service loop: the only code that talks to the backend
+
+void IoScheduler::submit_queued_locked() {
+    auto drain = [this](std::deque<uint64_t>& q) -> bool {   // false: backend full
+        while (!q.empty()) {
+            auto it = pending_.find(q.front());
+            if (it == pending_.end() || it->second.state != State::Queued) {
+                q.pop_front();   // settled or abandoned while queued
+                continue;
+            }
+            InFlight& p = it->second;
+            if (io_->submit(&p.req, 1) != 1) {
+                // The op pool IS the queue-depth gate, so a full pool refuses.
+                // A refusal with nothing in flight is not queue pressure: the
+                // read can never be submitted, so it completes as failed (it
+                // holds no DMA, so its memory is safe to free).
+                if (io_->in_flight() != 0) return false;
+                p.state = State::Done;
+                p.ok = false;
+                p.status = -1;
+                q.pop_front();
+                done_cv_.notify_all();
+                continue;
+            }
+            q.pop_front();
+            p.state = State::Submitted;
+            ++submitted_;
+            if (p.stage) {
+                // TRUE queue depth, sampled where the drive sees it (see IoStats).
+                const size_t nf = io_->in_flight();
+                const uint64_t t = steady_ns();
+                if (stats_.depth_t_last) stats_.depth_area_ns += stats_.depth_cur * (t - stats_.depth_t_last);
+                else stats_.depth_t0 = t;
+                stats_.depth_t_last = t;
+                stats_.depth_cur = nf;
+                stats_.depth_sum += nf;
+                ++stats_.depth_n;
+                if (nf > stats_.depth_max) stats_.depth_max = nf;
+                if (nf < stats_.depth_min) stats_.depth_min = nf;
+                if (nf < 4) ++stats_.depth_low;
+                p.t_submit_ns = steady_ns();
+            }
+        }
+        return true;
+    };
+    if (drain(urgent_)) drain(background_);
+}
+
+size_t IoScheduler::harvest(Lock& lk, size_t min_complete) {
     {
         const uint64_t now = steady_ns();
         if (stats_.pump_last_ns) {
@@ -73,16 +165,21 @@ size_t IoScheduler::pump(size_t min_complete) {
         stats_.pump_last_ns = now;
         ++stats_.pump_calls;
     }
-    std::vector<io::Completion> comps(64);
+    io::Completion comps[64];
     const auto pp0 = std::chrono::steady_clock::now();
-    const size_t got = io_->poll(comps.data(), comps.size(), min_complete);
+    lk.unlock();   // never hold the lock while blocked on the device
+    const size_t got = io_->poll(comps, 64, min_complete);
+    lk.lock();
     stats_.in_pump_ns += ns_since(pp0);
     stats_.pump_harvested += got;
+
+    InFlight* copies[64];
+    size_t n_copy = 0;
     for (size_t i = 0; i < got; ++i) {
         auto it = pending_.find(comps[i].tag);
         if (it == pending_.end()) continue;   // already settled
         InFlight& p = it->second;
-        p.done = true;
+        --submitted_;
         if (p.t_submit_ns) {
             const uint64_t us = (steady_ns() - p.t_submit_ns) / 1000;
             stats_.lat_sum_us += us; ++stats_.lat_n; stats_.lat_bytes += p.span;
@@ -96,26 +193,118 @@ size_t IoScheduler::pump(size_t min_complete) {
         // read rather than just asserting one happened.
         p.got    = static_cast<uint64_t>(comps[i].bytes);
         p.status = comps[i].status;
-        if (p.ok && p.mem) {
+        if (p.ok && p.mem) copies[n_copy++] = &p;   // Done only once the bytes are home
+        else               p.state = State::Done;
+    }
+    if (n_copy) {
+        // Off-lock: the entries are not Done, so no waiter touches them, and
+        // their addresses survive concurrent inserts (unordered_map).
+        lk.unlock();
+        uint64_t copy_ns = 0, copy_bytes = 0;
+        for (size_t i = 0; i < n_copy; ++i) {
+            InFlight& p = *copies[i];
             const auto c0 = std::chrono::steady_clock::now();
             std::memcpy(p.mem, p.stage + p.head, static_cast<size_t>(p.bytes));
-            stats_.memcpy_ns += ns_since(c0);
-            stats_.memcpy_bytes += p.bytes;
+            copy_ns += ns_since(c0);
+            copy_bytes += p.bytes;
         }
+        lk.lock();
+        stats_.memcpy_ns += copy_ns;
+        stats_.memcpy_bytes += copy_bytes;
+        for (size_t i = 0; i < n_copy; ++i) copies[i]->state = State::Done;
     }
+    if (got) done_cv_.notify_all();
     return got;
 }
 
-bool IoScheduler::wait_for_slot() {
-    // The op pool IS the queue-depth gate: beyond it submit() refuses, so drain.
-    while (io_->in_flight() >= io_->max_in_flight()) {
-        if (pump(1) == 0) return false;
+size_t IoScheduler::service(Lock& lk, size_t min_complete) {
+    submit_queued_locked();
+    if (submitted_ == 0) return 0;
+    const size_t got = harvest(lk, min_complete);
+    // Refill the slots just freed, so the drive is not idle until the next call.
+    if (got) submit_queued_locked();
+    return got;
+}
+
+void IoScheduler::run() {
+    Lock lk(m_);
+    for (;;) {
+        work_cv_.wait(lk, [this] {
+            return stop_ || (!dead_ && (!urgent_.empty() || !background_.empty() || submitted_ > 0));
+        });
+        if (dead_ || (stop_ && urgent_.empty() && background_.empty() && submitted_ == 0)) {
+            if (stop_) return;
+            continue;   // dead: nothing more will ever complete; wait for stop
+        }
+        submit_queued_locked();
+        if (submitted_ == 0) continue;   // everything queued was refused outright
+        if (harvest(lk, 1) == 0) {
+            // The device stopped answering with reads outstanding. Waiters see
+            // dead_ and take the leak paths (F2): nothing is freed under DMA.
+            dead_ = true;
+            done_cv_.notify_all();
+            continue;
+        }
+        submit_queued_locked();
+    }
+}
+
+void IoScheduler::kick() {
+    if (threaded_) return;   // the I/O thread is already doing this, continuously
+    Lock lk(m_);
+    service(lk, 0);
+}
+
+bool IoScheduler::all_done(const std::vector<uint64_t>& tags) const {
+    for (uint64_t t : tags) {
+        auto it = pending_.find(t);
+        if (it != pending_.end() && it->second.state != State::Done) return false;
     }
     return true;
 }
 
+bool IoScheduler::wait_all(Lock& lk, const std::vector<uint64_t>& tags) {
+    while (!all_done(tags)) {
+        if (threaded_) {
+            if (dead_) return false;
+            done_cv_.wait(lk);
+        } else if (service(lk, 1) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void IoScheduler::take_locked(uint64_t tag, uint8_t** stage, uint32_t* span, bool* ok) {
+    *stage = nullptr;
+    *span = 0;
+    auto it = pending_.find(tag);
+    if (it == pending_.end()) { *ok = false; return; }
+    *ok = it->second.ok;
+    *stage = it->second.stage;
+    *span = it->second.span;
+    pending_.erase(it);
+}
+
 // ---------------------------------------------------------------------------
 // submission
+
+uint64_t IoScheduler::enqueue(InFlight entry, IoPriority prio) {
+    Lock lk(m_);
+    const uint64_t tag = next_tag_++;
+    entry.req.tag = tag;
+    entry.state = State::Queued;
+    pending_[tag] = entry;
+    (prio == IoPriority::Urgent ? urgent_ : background_).push_back(tag);
+    if (threaded_) {
+        lk.unlock();
+        work_cv_.notify_one();
+    } else {
+        // Straight to the device when it has room, exactly as a direct submit did.
+        submit_queued_locked();
+    }
+    return tag;
+}
 
 uint64_t IoScheduler::submit_staged(const Source& s, void* dst, uint64_t bytes) {
     if (s.shard < 0 || static_cast<size_t>(s.shard) >= shards_.size()) return 0;
@@ -131,85 +320,73 @@ uint64_t IoScheduler::submit_staged(const Source& s, void* dst, uint64_t bytes) 
     // AND MANDATORY: without it no read can proceed, so a refused reservation must
     // reclaim rather than fail. Once accounting was switched on, reads began
     // failing outright at the cap with the cache still holding 9.89 of 10.21 GB.
+    //
+    // Allocated here, at enqueue, on the caller's thread. Staging is only ever
+    // freed by its owner (settle/discard), never on completion, so allocating a
+    // whole batch before its reads reach the device performs exactly the ledger
+    // operations, in exactly the order, that allocating each at submit did.
     const auto sa0 = std::chrono::steady_clock::now();
     uint8_t* stage = static_cast<uint8_t*>(
         mem_.alloc(mem::Category::IoStaging, span, al.memory));
-    stats_.stage_alloc_ns += ns_since(sa0);
-    ++stats_.stage_alloc_n;
+    const uint64_t alloc_ns = ns_since(sa0);
     if (!stage) {
         // T23: an earlier version pumped completions here hoping "completed
-        // reads still holding staging" would free room. They cannot: pump()
-        // only marks entries done -- staging is freed by each tag's OWNER
-        // (settle/discard), none of which can run between iterations of a
-        // loop on this single-threaded path. The ledger state was identical
-        // on every retry, so each pass was a blocking poll for nothing.
-        // Evicting cache is the one lever that actually moves the sum.
+        // reads still holding staging" would free room. They cannot: a
+        // completion only marks its entry done -- staging is freed by each
+        // tag's OWNER (settle/discard). Evicting cache is the one lever that
+        // actually moves the sum.
         if (reclaimer_ && reclaimer_->reclaim(span)) {
             stage = static_cast<uint8_t*>(
                 mem_.alloc(mem::Category::IoStaging, span, al.memory));
         }
     }
+    {
+        Lock lk(m_);
+        stats_.stage_alloc_ns += alloc_ns;
+        ++stats_.stage_alloc_n;
+    }
     if (!stage) return 0;
 
-    const uint64_t tag = next_tag_++;
-    io::ReadRequest r{f, lo, static_cast<uint32_t>(span), stage, tag};
-    if (io_->submit(&r, 1) != 1) {
-        mem_.free(mem::Category::IoStaging, stage, span);
-        return 0;
-    }
-    // TRUE queue depth, sampled where the drive sees it (see IoStats).
-    {
-        const size_t nf = io_->in_flight();
-        {
-            const uint64_t t = steady_ns();
-            if (stats_.depth_t_last) stats_.depth_area_ns += stats_.depth_cur * (t - stats_.depth_t_last);
-            else stats_.depth_t0 = t;
-            stats_.depth_t_last = t;
-            stats_.depth_cur = nf;
-        }
-        stats_.depth_sum += nf;
-        ++stats_.depth_n;
-        if (nf > stats_.depth_max) stats_.depth_max = nf;
-        if (nf < stats_.depth_min) stats_.depth_min = nf;
-        if (nf < 4) ++stats_.depth_low;
-    }
-
-    pending_[tag] = {stage, head, static_cast<uint32_t>(span), dst, bytes,
-                     false, false, 0, steady_ns()};
-    return tag;
+    InFlight e;
+    e.req = io::ReadRequest{f, lo, static_cast<uint32_t>(span), stage, 0};
+    e.stage = stage;
+    e.head = head;
+    e.span = static_cast<uint32_t>(span);
+    e.mem = dst;
+    e.bytes = bytes;
+    return enqueue(e, IoPriority::Urgent);
 }
 
 uint64_t IoScheduler::submit_unstaged(io::FileId f, uint64_t file_offset, uint32_t len,
-                                      void* dst, uint64_t head, uint64_t bytes) {
-    const uint64_t tag = next_tag_++;
-    io::ReadRequest r{f, file_offset, len, dst, tag};
-    // stage and mem both null: pump has nothing to copy, discard nothing to free.
-    pending_[tag] = {nullptr, head, len, nullptr, bytes, false, false};
-    if (io_->submit(&r, 1) != 1) {
-        pending_.erase(tag);
-        return 0;
-    }
-    return tag;
+                                      void* dst, uint64_t head, uint64_t bytes,
+                                      IoPriority prio) {
+    // stage and mem both null: nothing to copy on completion, nothing to free.
+    InFlight e;
+    e.req = io::ReadRequest{f, file_offset, len, dst, 0};
+    e.head = head;
+    e.span = len;
+    e.bytes = bytes;
+    return enqueue(e, prio);
 }
 
 void IoScheduler::discard(uint64_t tag) {
-    auto it = pending_.find(tag);
-    if (it == pending_.end()) return;
-    mem_.free(mem::Category::IoStaging, it->second.stage, it->second.span);
-    pending_.erase(it);
+    uint8_t* stage = nullptr;
+    uint32_t span = 0;
+    bool ok = false;
+    {
+        Lock lk(m_);
+        take_locked(tag, &stage, &span, &ok);
+    }
+    mem_.free(mem::Category::IoStaging, stage, span);
 }
 
 bool IoScheduler::settle(std::vector<uint64_t>& tags, bool* backend_dead) {
     if (backend_dead) *backend_dead = false;
+    std::vector<std::pair<uint8_t*, uint32_t>> frees;
     bool ok = true;
-    for (;;) {
-        bool all = true;
-        for (uint64_t t : tags) {
-            auto it = pending_.find(t);
-            if (it != pending_.end() && !it->second.done) { all = false; break; }
-        }
-        if (all) break;
-        if (pump(1) == 0) {
+    {
+        Lock lk(m_);
+        if (!wait_all(lk, tags)) {
             // F2 (same shape as read_batch): a dead backend with reads
             // outstanding must LEAK the staging, never free under DMA.
             // I1: THE line H15 forgot -- without it the out-param stayed false,
@@ -218,20 +395,19 @@ bool IoScheduler::settle(std::vector<uint64_t>& tags, bool* backend_dead) {
             // flag and never sets it is worse than no fix: it retires the
             // FATAL message that would have said so.
             if (backend_dead) *backend_dead = true;
-            std::fprintf(stderr,
-                         "[dray] FATAL: backend dead with reads outstanding; "
-                         "leaking %zu staging buffers (no-cancel contract)\n",
-                         tags.size());
+            log_leak(tags.size());
             for (uint64_t t : tags) pending_.erase(t);
             tags.clear();
             return false;
         }
+        for (uint64_t t : tags) {
+            uint8_t* stage; uint32_t span; bool tok;
+            take_locked(t, &stage, &span, &tok);
+            if (!tok) ok = false;
+            frees.emplace_back(stage, span);
+        }
     }
-    for (uint64_t t : tags) {
-        auto it = pending_.find(t);
-        if (it == pending_.end() || !it->second.ok) ok = false;
-        discard(t);
-    }
+    for (const auto& f : frees) mem_.free(mem::Category::IoStaging, f.first, f.second);
     tags.clear();
     return ok;
 }
@@ -241,56 +417,38 @@ bool IoScheduler::settle(std::vector<uint64_t>& tags, bool* backend_dead) {
 
 bool IoScheduler::read_batch(const std::vector<Slice>& slices) {
     if (slices.empty()) return true;
-    ++stats_.io_batches;
-    stats_.io_slices += slices.size();
-    if (slices.size() > stats_.io_batch_max) stats_.io_batch_max = slices.size();
+    {
+        Lock lk(m_);
+        ++stats_.io_batches;
+        stats_.io_slices += slices.size();
+        if (slices.size() > stats_.io_batch_max) stats_.io_batch_max = slices.size();
+    }
 
     std::vector<uint64_t> tags;
     tags.reserve(slices.size());
     bool failed = false;
 
+    // Every read enqueued before any is waited on, so the drive sees the whole
+    // batch as a deep queue.
     for (const Slice& sl : slices) {
-        // Respect the backend's depth: beyond it submit() refuses, so drain first.
-        if (!wait_for_slot()) { failed = true; break; }
         const uint64_t tag = submit_staged(sl.src, sl.dst, sl.len);
         if (tag == 0) { failed = true; break; }
         tags.push_back(tag);
     }
 
-    // F2: settle ALL submitted tags UNCONDITIONALLY before any discard --
+    // F2: settle ALL enqueued tags UNCONDITIONALLY before any discard --
     // success or failure, every submitted read has DMA outstanding into its
     // staging buffer, and discard() frees that buffer for immediate reuse.
     // The old shape skipped this wait when `failed` was set mid-submission,
     // freeing under DMA (the no-cancel contract, storage.h and D8; T23's
     // deletion of submit_one's drain loop made the path reachable). A failed
     // batch still waits for its own reads; only the RESULT is failed.
-    for (;;) {
-        bool outstanding = false;
-        for (uint64_t t : tags) {
-            auto it = pending_.find(t);
-            if (it != pending_.end() && !it->second.done) { outstanding = true; break; }
-        }
-        if (!outstanding) break;
-        if (pump(1) == 0) {
-            // Backend dead with reads outstanding. Freeing under possible DMA
-            // trades a loud failure for silent corruption, so the staging is
-            // LEAKED deliberately: pending entries are dropped without a free,
-            // the bytes stay charged to IoStaging forever, and the ledger
-            // honestly shows the cost of a dead backend.
-            std::fprintf(stderr,
-                         "[dray] FATAL: backend dead with reads outstanding; "
-                         "leaking %zu staging buffers (no-cancel contract)\n",
-                         tags.size());
-            for (uint64_t t : tags) pending_.erase(t);
-            return false;
-        }
-    }
-
-    for (uint64_t t : tags) {
-        auto it = pending_.find(t);
-        if (it == pending_.end() || !it->second.ok) failed = true;
-        discard(t);
-    }
+    //
+    // A dead backend with reads outstanding: freeing under possible DMA trades a
+    // loud failure for silent corruption, so settle() LEAKS the staging
+    // deliberately -- the bytes stay charged to IoStaging forever, and the
+    // ledger honestly shows the cost of a dead backend.
+    if (!settle(tags)) failed = true;
     return !failed;
 }
 
@@ -305,7 +463,8 @@ bool IoScheduler::read_exact(const Source& s, void* dst, uint64_t bytes) {
 
 bool IoScheduler::read_exact_via(io::FileId f, const Source& s, void* dst, uint64_t bytes) {
     // Swap the shard table entry for the duration of one read, so the widening
-    // and the tag handling are exactly read_exact's.
+    // and the tag handling are exactly read_exact's. The I/O thread never reads
+    // the shard table (requests carry their FileId), so this is safe either way.
     const io::FileId saved = shards_[static_cast<size_t>(s.shard)];
     shards_[static_cast<size_t>(s.shard)] = f;
     const bool got = read_exact(s, dst, bytes);
@@ -331,7 +490,7 @@ void* IoScheduler::read_whole(mem::Category cat, const Source& s, uint64_t bytes
         if (failures_ < 8) {
             std::fprintf(stderr, "[dray] DIRECT %s: shard=%d bytes=%llu inflight=%zu/%zu\n",
                          why, s.shard, (unsigned long long)bytes,
-                         io_->in_flight(), io_->max_in_flight());
+                         in_flight(), io_->max_in_flight());
             std::fflush(stderr);
         }
         return nullptr;
@@ -349,39 +508,32 @@ void* IoScheduler::read_whole(mem::Category cat, const Source& s, uint64_t bytes
     uint8_t* base = static_cast<uint8_t*>(mem_.alloc(cat, span, al.memory));
     if (!base) return bail("ALLOC");
 
-    // The op pool IS the queue-depth gate, so a full pool makes submit refuse. Drain
-    // and retry rather than failing the read: a transient queue-full is not a
-    // reason to abandon a weight the graph needs.
-    uint64_t tag = 0;
-    for (int attempt = 0; attempt < 64; ++attempt) {
-        tag = submit_unstaged(f, lo, static_cast<uint32_t>(span), base, head, bytes);
-        if (tag != 0) break;
-        if (io_->in_flight() == 0) break;   // not queue pressure; genuinely refused
-        if (pump(1) == 0) break;
-    }
-    if (tag == 0) {
-        mem_.free(cat, base, span);
-        return bail("SUBMIT");
-    }
-    bool backend_dead = false;
-    for (;;) {
+    // Queued like any other urgent read: a full device queue delays it, never
+    // refuses it. A read the backend genuinely refuses completes as failed.
+    const uint64_t tag = submit_unstaged(f, lo, static_cast<uint32_t>(span), base, head, bytes);
+    const std::vector<uint64_t> one{tag};
+    bool ok = false;
+    uint64_t got = 0;
+    int status = 0;
+    bool found = false;
+    {
+        Lock lk(m_);
+        if (!wait_all(lk, one)) {
+            // Pass-4b: a dead backend here means the read may STILL be writing into
+            // `base` -- fabricating done/ok and freeing below was the third
+            // free-under-DMA site of the F2 class (the first two were fixed, this
+            // one was not enumerated). Same remedy: leak deliberately and loudly.
+            std::fprintf(stderr,
+                         "[dray] FATAL: backend dead with a direct read outstanding; "
+                         "leaking its staging (no-cancel contract)\n");
+            pending_.erase(tag);
+            return nullptr;
+        }
         auto it = pending_.find(tag);
-        if (it == pending_.end() || it->second.done) break;
-        // Pass-4b: a dead backend here means the read may STILL be writing into
-        // `base` -- fabricating done/ok and freeing below was the third
-        // free-under-DMA site of the F2 class (the first two were fixed, this
-        // one was not enumerated). Same remedy: leak deliberately and loudly.
-        if (pump(1) == 0) { backend_dead = true; break; }
-    }
-    if (backend_dead) {
-        std::fprintf(stderr,
-                     "[dray] FATAL: backend dead with a direct read outstanding; "
-                     "leaking its staging (no-cancel contract)\n");
+        found = it != pending_.end();
+        if (found) { ok = it->second.ok; got = it->second.got; status = it->second.status; }
         pending_.erase(tag);
-        return nullptr;
     }
-    auto it = pending_.find(tag);
-    const bool ok = (it != pending_.end()) && it->second.ok;
     if (!ok && failures_ < 8) {
         // Name the reason. "read failed" without the numbers has cost hours on this
         // codebase every time; status and the short-read arithmetic identify it at
@@ -391,11 +543,9 @@ void* IoScheduler::read_whole(mem::Category cat, const Source& s, uint64_t bytes
             "span=%u got=%lld status=%d\n",
             s.shard, (unsigned long long)s.offset, (unsigned long long)lo,
             (unsigned long long)head, (unsigned long long)bytes, (unsigned)span,
-            it == pending_.end() ? -1LL : (long long)it->second.got,
-            it == pending_.end() ? -1 : it->second.status);
+            found ? (long long)got : -1LL, found ? status : -1);
         std::fflush(stderr);
     }
-    pending_.erase(tag);
     if (!ok) { mem_.free(cat, base, span); return nullptr; }
 
     *out_alloc = span;
@@ -420,16 +570,19 @@ void IoStats::append(std::ostream& o) const {
           << lat_n << " reads (" << (lat_bytes / lat_n / 1024) << " KiB mean): <200us "
           << lat_bucket[0] << ", <500 " << lat_bucket[1] << ", <1ms " << lat_bucket[2]
           << ", <2ms " << lat_bucket[3] << ", slower " << lat_bucket[4]
-          << "; polls " << pump_calls << " mean gap "
-          << (pump_calls > 1 ? pump_gap_us / (pump_calls - 1) : 0) << "us, "
+          << "; " << (threaded ? "I/O thread" : "compute thread") << " polls " << pump_calls
+          << " mean gap " << (pump_calls > 1 ? pump_gap_us / (pump_calls - 1) : 0) << "us, "
           << (pump_calls ? pump_harvested / pump_calls : 0) << " harvested each"
           << "; gap buckets <100us " << gap_bucket[0] << " <1ms " << gap_bucket[1]
           << " <5ms " << gap_bucket[2] << " <20ms " << gap_bucket[3]
           << " longer " << gap_bucket[4] << ", max " << gap_max_us << "us, "
-          << (gap_long_us / 1000) << "ms total spent in gaps over 5ms, "
+          << (gap_long_us / 1000)
+          << (threaded ? "ms IDLE in gaps over 5ms (nothing queued: the engine asked for nothing), "
+                       : "ms total spent in gaps over 5ms (completions uncollected), ")
           << (in_pump_ns / 1000000) << "ms BLOCKED INSIDE poll"
           << "; staging memcpy " << (memcpy_ns / 1000000) << "ms for "
-          << (memcpy_bytes / 1000000) << " MB on the poll thread"
+          << (memcpy_bytes / 1000000) << " MB on the "
+          << (threaded ? "I/O thread" : "compute thread")
           << ", staging alloc " << (stage_alloc_ns / 1000000) << "ms over "
           << stage_alloc_n << " reads";
     }

@@ -16,16 +16,35 @@
 //   outstanding, the buffers are LEAKED deliberately and loudly (F2): freeing
 //   under DMA trades a loud failure for silent corruption.
 //
-//   READS ONLY PROGRESS WHEN SOMEONE POLLS. There is no I/O thread: completions
-//   are harvested on the compute thread, from inside the ggml callbacks. This
-//   class is where a dedicated I/O thread would live, and nothing above it would
-//   need to know.
+//   A SOFTWARE QUEUE IN FRONT OF THE DEVICE. Callers enqueue; they are never
+//   refused for queue depth and never wait for a slot. The scheduler keeps the
+//   backend up to its depth, reads a node is waiting on (Urgent) before ring
+//   read-ahead (Background). Order changes only WHEN a read lands, never which
+//   bytes, so everything decided above this class stays deterministic.
+//
+//   ONE THREAD OWNS THE DEVICE. With the I/O thread running (the default once
+//   loading is done), it alone calls backend submit/poll: it keeps the queue
+//   full, harvests completions and copies staged bytes home WHILE the compute
+//   thread computes. Before, reads only progressed between graph nodes -- in a
+//   K3 run the device sat unharvested for ~91 of 121 s. Without the thread
+//   (DRAY_IO_THREAD=0, and during load) the compute thread drives the same
+//   service loop itself, from kick() and while waiting.
+//
+//   The compute thread keeps everything else: staging allocation and freeing,
+//   the ledger, every decision. The thread changes WHEN a read lands, never
+//   what is read, so bytes, nodes and text are identical with it on or off.
+//   (A 2026-08-24 attempt put a second harvester inside the Windows backend,
+//   next to its own reaping path, and raced; here there is only one consumer.)
 
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <ostream>
 #include <string>
 #include <unordered_map>
@@ -47,6 +66,11 @@ public:
 protected:
     ~Reclaimer() = default;
 };
+
+// Which queue a read joins. Urgent: something is (or soon will be) waiting on it
+// -- sync batches, whole tensors, expert regions. Background: speculative ring
+// read-ahead, submitted only when no urgent read is queued.
+enum class IoPriority : uint8_t { Urgent, Background };
 
 // One region of a shard to land at `dst`.
 struct Slice {
@@ -82,6 +106,12 @@ struct IoStats {
     uint64_t memcpy_ns = 0, memcpy_bytes = 0;
     uint64_t stage_alloc_ns = 0, stage_alloc_n = 0;
     uint64_t io_batches = 0, io_slices = 0, io_batch_max = 0;
+    // Who polled. Without the I/O thread a poll gap is the compute thread's
+    // ABSENCE (reads finished, nobody collected them -- the 2026-08-24 defect).
+    // With it, a gap is the I/O thread IDLE: nothing queued, nothing in flight,
+    // so the engine had nothing to ask the drive for. Same numbers, opposite
+    // meaning, so the report says which it is.
+    bool     threaded = false;
 
     // Everything from ", io ..." onward in the streamer report.
     void append(std::ostream& o) const;
@@ -100,32 +130,48 @@ public:
     // False with `error` set on failure; whatever did open is closed at teardown.
     bool open(const std::vector<std::string>& shard_paths, uint32_t queue_depth,
               std::string* error);
+    // The same, over a backend the caller supplies -- the seam the unit tests use
+    // to drive this class with a scripted fake (out-of-order, short, failing,
+    // dead). Takes ownership.
+    bool open_with(std::unique_ptr<io::Backend> backend,
+                   const std::vector<std::string>& shard_paths, std::string* error);
     void set_reclaimer(Reclaimer* r) { reclaimer_ = r; }
+
+    // Moves the service loop onto the I/O thread; from then on only that thread
+    // calls the backend. Call once loading is done (the file table is touched
+    // single-threaded during load). No-op if already running; if the thread
+    // cannot be created the scheduler simply stays inline.
+    void start_thread();
+    // Stops and joins the I/O thread. Every read must have been settled first;
+    // the destructor calls it.
+    void stop_thread();
+    bool threaded() const { return threaded_; }
 
     bool     is_open() const { return io_ != nullptr; }
     // The max alignment across ALL shards (Invariant 5: discovered, and the
     // conservative max is correct for every member).
     uint32_t align() const { return align_; }
     io::FileId file(int32_t shard) const { return shards_[static_cast<size_t>(shard)]; }
-    size_t   in_flight() const { return io_->in_flight(); }
+    // Reads handed to the device and not yet harvested (diagnostics only).
+    size_t   in_flight() const;
     size_t   max_in_flight() const { return io_->max_in_flight(); }
     std::string describe() const;
 
-    // Harvests up to a batch of completions and routes each to its registry
-    // entry, copying staged bytes to their destination. Returns how many were
-    // harvested; 0 while reads are outstanding means the backend is dead.
-    size_t pump(size_t min_complete);
-    // Pumps until the backend will accept another request. False = backend dead.
-    bool wait_for_slot();
+    // Makes progress without blocking: submits queued reads and harvests
+    // whatever has already completed. For callers with CPU time to give; a
+    // no-op when the I/O thread is doing it continuously.
+    void kick();
 
-    // Registers and submits one read through an accounted staging buffer (the
-    // file range is widened to the shard's alignment). 0 = not started.
+    // Enqueues one read through an accounted staging buffer (the file range is
+    // widened to the shard's alignment). 0 = not started: the staging could not
+    // be allocated even after reclaiming, or the shard is unknown.
     uint64_t submit_staged(const Source& s, void* dst, uint64_t bytes);
-    // Registers and submits one read straight into `dst`, which the caller has
-    // already widened and aligned. The read succeeds when the device returns at
-    // least head + bytes. Not sampled into the depth statistics. 0 = refused.
+    // Enqueues one read straight into `dst`, which the caller has already
+    // widened and aligned. The read succeeds when the device returns at least
+    // head + bytes. Not sampled into the depth statistics. Never refused.
     uint64_t submit_unstaged(io::FileId f, uint64_t file_offset, uint32_t len,
-                             void* dst, uint64_t head, uint64_t bytes);
+                             void* dst, uint64_t head, uint64_t bytes,
+                             IoPriority prio = IoPriority::Urgent);
     // Drops a completed tag, freeing its staging.
     void discard(uint64_t tag);
     // Waits for every tag, then discards them all. False if any read failed.
@@ -148,24 +194,50 @@ public:
                      uint64_t* out_alloc, uint32_t* out_head);
 
     // Handles for callers that need independent access to the same files.
+    // Load time only (before start_thread): the backend's file table is not
+    // shared with the I/O thread.
     io::FileId open_file(const std::string& path) { return io_->open(path); }
     void       close_file(io::FileId f) { io_->close(f); }
 
-    const IoStats& stats() const { return stats_; }
+    // A snapshot: the I/O thread keeps updating the live counters.
+    IoStats stats() const;
 
 private:
+    enum class State : uint8_t { Queued, Submitted, Done };
     struct InFlight {
-        uint8_t* stage = nullptr;
+        io::ReadRequest req{};     // what goes to the backend
+        uint8_t* stage = nullptr;  // staged reads: the bounce buffer (req.dst)
         uint64_t head = 0;
         uint32_t span = 0;
         void*    mem = nullptr;    // destination the staged bytes are copied to
         uint64_t bytes = 0;
-        bool     done = false;
+        State    state = State::Queued;
         bool     ok = false;
         uint64_t got = 0;          // bytes the device actually returned
         uint64_t t_submit_ns = 0;  // 0 = not timed (unstaged reads)
         int      status = 0;
     };
+
+    using Lock = std::unique_lock<std::mutex>;
+
+    uint64_t enqueue(InFlight entry, IoPriority prio);
+    // Every *_locked function and every function taking a Lock runs with m_ held.
+    // Submits queued reads, urgent first, until the backend is full.
+    void   submit_queued_locked();
+    // Polls the backend (lock RELEASED while blocked), routes each completion to
+    // its entry and copies staged bytes home (lock released while copying), then
+    // marks the entries Done and wakes waiters. Returns how many were harvested.
+    size_t harvest(Lock& lk, size_t min_complete);
+    // Inline mode's service loop: submit, harvest, submit again. 0 from a
+    // blocking call while reads are outstanding means the backend is dead.
+    size_t service(Lock& lk, size_t min_complete);
+    // Waits until every tag is Done. False: the backend died with some of them
+    // outstanding.
+    bool   wait_all(Lock& lk, const std::vector<uint64_t>& tags);
+    bool   all_done(const std::vector<uint64_t>& tags) const;
+    // Removes a Done entry, returning its staging (freed by the caller, off-lock).
+    void   take_locked(uint64_t tag, uint8_t** stage, uint32_t* span, bool* ok);
+    void   run();   // the I/O thread
 
     AccountedAlloc&                        mem_;
     const std::atomic<uint64_t>&           failures_;
@@ -173,9 +245,24 @@ private:
     std::unique_ptr<io::Backend>           io_;
     std::vector<io::FileId>                shards_;
     uint32_t                               align_ = 4096;
-    std::unordered_map<uint64_t, InFlight> pending_;   // by tag
+
+    // Shared with the I/O thread, all under m_.
+    mutable std::mutex                     m_;
+    std::condition_variable                work_cv_;   // wakes the I/O thread
+    std::condition_variable                done_cv_;   // wakes waiters
+    std::unordered_map<uint64_t, InFlight> pending_;   // by tag; element addresses
+                                                        // are stable across inserts
+    std::deque<uint64_t>                   urgent_;     // queued tags, FIFO
+    std::deque<uint64_t>                   background_;
+    size_t                                 submitted_ = 0;   // entries in the device
     uint64_t                               next_tag_ = 1;
+    bool                                   stop_ = false;
+    bool                                   dead_ = false;    // I/O thread saw the device die
     IoStats                                stats_;
+
+    std::thread                            worker_;
+    bool                                   threaded_ = false;   // compute thread only
+    bool                                   start_tried_ = false;
 };
 
 }  // namespace dray::backend

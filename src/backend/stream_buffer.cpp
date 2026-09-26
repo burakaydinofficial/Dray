@@ -379,6 +379,10 @@ bool Streamer::materialise(ggml_tensor* node) {
     Impl& im = *impl_;
     ++nodes_;
 
+    // Loading is over by the first node (floor reads and self_check drove the
+    // queue themselves): from here the I/O thread owns the device.
+    if (im.flags.io_thread && !im.io.threaded()) im.io.start_thread();
+
     // DRAY_TRACE=1 prints every node as it is materialised, unbuffered, so the
     // last line before a fault names the node that faulted. Guessing at which node
     // crashed from an exit code cost several wrong diagnoses.

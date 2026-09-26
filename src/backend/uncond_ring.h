@@ -109,6 +109,8 @@ private:
     // reads were the dead ones used to be freed under DMA (review finding,
     // 2026-09-25).
     void retire_dead_ring();
+    // Waits for a segment's chunks and releases them from the read-ahead count.
+    bool settle_segment(Segment& sg, bool* dead);
 
     Parts          p_;
     const bool     no_retain_;
@@ -124,6 +126,7 @@ private:
     std::vector<ggml_tensor*>        consumed_order_;
     std::unordered_set<ggml_tensor*> consumed_seen_;
     uint32_t       idle_backoff_ = 0;           // S22: sleeps after a fruitless lap
+    size_t         live_chunks_ = 0;            // chunk reads enqueued, not yet settled
     // Why the producer stopped, per call site -- 64 ring-fed twice in a row with
     // two different theories is two theories too many. Indexed: 0=depth 1=lap
     // 2=full-at-wrap 3=full 4=submit-refused 5=produced-nothing-else.

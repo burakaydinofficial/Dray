@@ -30,6 +30,7 @@ const char* const kDrayEnvVars[] = {
     "DRAY_SLOW_LOAD",
     "DRAY_FORCE_STREAM",
     "DRAY_IO_STATS",
+    "DRAY_IO_THREAD",
     "DRAY_RESIDENT",
     "DRAY_TRACE",
     "DRAY_VULKAN",

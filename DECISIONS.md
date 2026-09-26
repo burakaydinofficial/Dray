@@ -1,3 +1,68 @@
+# The I/O thread lands, and the K3 slowdown was two things, neither the streamer (2026-09-26)
+
+**K3 since the 08-14 headline.** A clean A/B (old/new/new/old, idle drive, 9 GiB,
+16 tokens) gave 7596a8e 17.2/17.3 s/tok against today's 20.6/19.7, and 938 vs
+989 GB. A bisect over the 250 commits between, each point probed first and
+then run at a cap giving ~4.3 GB of cache (a given cap buys each commit a
+different budget), plus drift controls, separated two causes:
+
+- BYTES: honest accounting. The cap now covers everything the process commits,
+  so 9 GiB leaves 1.13 GB of cache where 08-14 had 4.36. At an equal budget the
+  bytes match (941.6 vs 938.1 GB). 8 GiB is now refused for K3 for the same
+  reason; the 08-14 8 GiB configuration no longer fits once memory is counted.
+- TIME (~11%): the Vulkan backend COMPILED IN, never used. Every build before
+  8583e9c (which made Vulkan an option) ran 18.1-18.8; every Vulkan-carrying
+  build 19.6-20.9. Same code, CPU-only vs Vulkan-carrying, ABBA at 12.25 GiB:
+  18.3/18.5 vs 20.6/20.0, bytes and text identical. ggml registers the Vulkan
+  backend eagerly (ggml_vk_instance_init), waking the GPU driver before --gpu
+  is checked; removing the duplicate CPU backend llama.cpp made did NOT help.
+  (Laptop with a discrete GPU; the cost may differ elsewhere.) Fixed in d51cb7e:
+  Vulkan is a build-time opt-in, and --gpu refuses on a CPU-only binary.
+
+CPU-only today (18.4) matches 08-19 code at the same point in the session
+(18.4): nothing else in those commits slowed K3. The published head-to-head
+(8 GiB, 16.1 s/token) is not reproducible on current code; correcting it is
+the owner's call.
+
+**The I/O thread (8550714, 41ac5bb, a97a356).** The fix the 08-24 attempt
+failed at, rebuilt on two rules: ONE consumer of the backend (only the I/O
+thread calls submit/poll -- that attempt added a second harvester inside the
+Windows backend), and the thread changes WHEN, never WHAT (staging, the
+ledger and every decision stay on the compute thread). Proven before any
+threading with a scripted fake backend and mutation tests; ThreadSanitizer
+on the Linux VM reports nothing over five runs, and flags an injected
+unlocked insert at once. Golden identical with the thread on (twice) and
+off; archgate 5/5 both ways.
+
+K3, 12.25 GiB (4.2 GB cache), 16 tokens, CPU-only build, same binary, ABBA,
+Windows "Balanced" power plan:
+
+  thread off   17.9  18.8 s/tok   940.82  940.91 GB
+  thread on    16.4  16.6 s/tok   940.87  940.83 GB     text identical
+
+~10% faster decode, same bytes. Read latency 18.6 -> 11.5 ms (collected
+promptly); the 55-61 s of staging copies moved off the compute thread.
+What remains is not the device: with the thread, the long poll gaps are the
+I/O thread IDLE -- nothing queued. CORRECTION (same day): not because the
+ring is arena-bound, as first written. Step 2 bounded read-ahead by chunks
+outstanding until CONSUMED, and on K3 the ring now stops on that bound on
+every call (stops d=544784, full=0; the old code stopped on a full arena).
+That cap throttles look-ahead far below the arena; the other part is that
+the next layer's experts are not yet known. Both are decision-side.
+DRAY_IO_THREAD=0 restores the old path.
+
+Re-measured the same day in the Windows "High performance" power plan (the
+row above was Balanced; timings are only comparable within one plan):
+
+  thread off   13.6  13.0 s/tok   940.82  940.84 GB
+  thread on    12.4  12.5 s/tok   940.82  940.89 GB     text identical
+
+~6% faster in that plan: with the CPU clocked higher, less of each token was
+waiting on uncollected reads to begin with. The plan itself moves K3 by
+~25%, which is why every timing here now names it.
+
+---
+
 # The audit-fix arc: 21 agents, ~110 findings, 13 batches (2026-08-24)
 
 The owner asked for a swarm review with NO self-filtering -- false positives
