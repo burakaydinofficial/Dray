@@ -118,7 +118,7 @@ GPU decode LOSES on every model measured, in all fifteen comparable pairs, so
 `--gpu` is worth flipping for prompt-heavy work and not otherwise. It also
 RAISES the minimum cap, because the Vulkan compute buffer sits inside your
 budget: the 35B needs 4 GiB instead of 3, the 27B 5 instead of 4, K3 10 instead
-of 9. It is opt-in and stays that way.
+of 9. It is opt-in twice -- at build time and at run time (see Build).
 
 **Batched decode (2026-08-19, sparse models 2026-08-23).** One decode step reads the union of every
 sequence's expert selections, so sequences share most of the stream. Measured
@@ -201,6 +201,15 @@ PR that has not merged yet). The dev preset is portable (Windows and macOS); a
 linux preset and untested ARM64 crosses exist beside it.
 `-DDRAY_METAL_BUILD=ON` builds the experimental Metal path, runtime-gated by
 `DRAY_METAL=1`.
+
+`--gpu` needs the Vulkan backend, which the default build leaves out: configure with
+`-DDRAY_VULKAN_BUILD=ON` (Vulkan SDK installed), or on Windows run
+`scripts\build.ps1 -Vulkan`. It is left out because an unused backend is not free --
+ggml initialises it at startup, which wakes the GPU driver before `--gpu` is ever
+checked. Measured on Kimi K3, same code, same bytes and text: 18.4 s/token CPU-only
+against 20.3 with Vulkan compiled in and never used (a laptop with a discrete GPU; the
+cost may differ elsewhere). A binary without it refuses `--gpu` rather than quietly
+running on the CPU.
 
 ## Use
 

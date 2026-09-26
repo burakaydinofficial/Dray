@@ -893,7 +893,7 @@ Plan build_plan(const std::string& gguf_path, uint64_t cap_bytes, uint32_t n_ctx
                 group_digits(shard_end) + " B but the file is " +
                 group_digits(shard_file_bytes[s]) + " B";
             if (!allow) {
-                for (gguf_context* c : ctxs) gguf_free(c);
+                for (gguf_context* ctx : ctxs) gguf_free(ctx);
                 return fail("REFUSED: " + what +
                             ". A short shard serves plausible text from garbage weights; "
                             "re-download it, or set DRAY_ALLOW_TRUNCATED=1 to proceed anyway.");
@@ -958,7 +958,7 @@ Plan build_plan(const std::string& gguf_path, uint64_t cap_bytes, uint32_t n_ctx
     // Vocab size drives the Misc estimate. Prefer the token-list array length,
     // which is exact; fall back to the scalar key some converters write.
     {
-        const int kid = gguf_find_key(meta, "tokenizer.ggml.tokens");
+        const int64_t kid = gguf_find_key(meta, "tokenizer.ggml.tokens");
         if (kid >= 0 && gguf_get_kv_type(meta, kid) == GGUF_TYPE_ARRAY) {
             g.n_vocab = static_cast<uint64_t>(gguf_get_arr_n(meta, kid));
         }

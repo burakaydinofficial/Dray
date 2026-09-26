@@ -39,20 +39,28 @@ else()
     set(GGML_METAL           OFF CACHE BOOL "" FORCE)
 endif()
 set(GGML_CUDA            OFF CACHE BOOL "" FORCE)
-# GPU (owner decision 2026-08-21): ONE binary, runtime opt-in. The Vulkan
-# backend is compiled in whenever the SDK is present so users opt in AT START
-# (--gpu or DRAY_VULKAN=1); without consent the engine restricts llama to
-# CPU devices and stays byte-identical to a CPU-only build (difftest-gated).
-# Machines without the SDK (CI runners included) build CPU-only, silently
-# correct. DRAY_VULKAN_BUILD=OFF still forces it out entirely.
-option(DRAY_VULKAN_BUILD "build ggml Vulkan backend when the SDK is found (runtime-gated by --gpu)" ON)
-find_package(Vulkan QUIET)
+# GPU is a BUILD-TIME opt-in (owner decision 2026-09-26, replacing the
+# 2026-08-21 "one binary, runtime opt-in"). An unused Vulkan backend is not
+# free: ggml registers it eagerly at startup (ggml_vk_instance_init), which
+# loads the GPU driver and queries the device before --gpu is ever checked.
+# Measured on K3 (laptop, Core Ultra 7 + RTX 4070): same code, same bytes and
+# text, 18.4 s/token CPU-only vs 20.3 with Vulkan compiled in and unused. So
+# the default build is CPU-only; configure with -DDRAY_VULKAN_BUILD=ON (the
+# Vulkan SDK must be installed) to get --gpu. A binary without a GPU backend
+# refuses --gpu instead of silently running on the CPU.
+option(DRAY_VULKAN_BUILD "build the ggml Vulkan backend (enables --gpu; costs ~11% on CPU runs when unused)" OFF)
+if (DRAY_VULKAN_BUILD)
+    find_package(Vulkan QUIET)
+endif()
 if (DRAY_VULKAN_BUILD AND Vulkan_FOUND)
     set(GGML_VULKAN      ON  CACHE BOOL "" FORCE)
-    message(STATUS "dray: Vulkan backend IN (runtime opt-in via --gpu / DRAY_VULKAN=1)")
+    message(STATUS "dray: Vulkan backend IN (--gpu available)")
 else()
+    if (DRAY_VULKAN_BUILD)
+        message(WARNING "DRAY_VULKAN_BUILD=ON but the Vulkan SDK was not found: building CPU-only")
+    endif()
     set(GGML_VULKAN      OFF CACHE BOOL "" FORCE)
-    message(STATUS "dray: Vulkan backend OUT (SDK not found or disabled); CPU-only build")
+    message(STATUS "dray: CPU-only build (default; -DDRAY_VULKAN_BUILD=ON for --gpu)")
 endif()
 set(GGML_OPENMP          OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)

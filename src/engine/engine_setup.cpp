@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <thread>
 
+#include "ggml-backend.h"
 #include "llama.h"
 
 #include "backend/stream_buffer.h"
@@ -98,6 +99,18 @@ std::unique_ptr<Engine> Engine::open(const EngineConfig& cfg, std::string* err) 
     }
 
     llama_backend_init();
+
+    // --gpu is consent, not a wish: with no GPU device to honour it, refuse
+    // rather than run a CPU-only engine the user did not ask for. The usual
+    // cause is the default build, which leaves Vulkan out (see CMakeLists.txt).
+    if (gpu_consent &&
+        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) == nullptr &&
+        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) == nullptr) {
+        return fail(ggml_backend_reg_by_name("Vulkan") == nullptr
+            ? "REFUSED: --gpu, but this binary has no GPU backend. The default build is "
+              "CPU-only; rebuild with -DDRAY_VULKAN_BUILD=ON (Vulkan SDK required)."
+            : "REFUSED: --gpu, but the Vulkan backend found no GPU device on this machine.");
+    }
 
     std::unique_ptr<Engine> e(new Engine());
     e->plan_ = std::make_unique<plan::Plan>(std::move(p));
