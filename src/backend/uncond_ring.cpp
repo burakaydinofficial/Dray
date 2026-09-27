@@ -14,7 +14,7 @@ void UncondRing::allocate(uint64_t bytes, uint32_t align) {
 void UncondRing::record_consumption(ggml_tensor* t) {
     if (!arena_ || active_) return;
     const Source* s = p_.tensors.source_of(t);
-    if (s && !s->pinned && !s->sliceable && t->ne[2] <= 1 && consumed_seen_.insert(t).second) {
+    if (s && !s->pinned && !s->sliceable && consumed_seen_.insert(t).second) {
         consumed_order_.push_back(t);
     }
 }
@@ -29,8 +29,13 @@ void UncondRing::on_pass(uint32_t pass) {
     for (ggml_tensor* t : consumed_order_) {
         const Source* s = p_.tensors.source_of(t);
         if (!s) continue;
+        // sliceable covers the routed experts (MUL_MAT_ID compaction) and the row-
+        // sliced embedding, by the planner's CLASS. There was also a shape test
+        // here, ne[2] > 1, taken to mean "expert tensor"; it excluded 3-D weights
+        // that are NOT experts -- K3's MLA attn_k_b/attn_v_b and KDA ssm_conv1d_* --
+        // so every token read ~190 of them synchronously, outside both paths
+        // (~270 MB/token, measured 2026-09-26). Class, never shape (Invariant 3).
         if (s->pinned || s->sliceable) continue;
-        if (t->ne[2] > 1) continue;              // routed experts: compacted path
         // NO resident filter. The producer skips resident tensors per lap, which
         // adapts every cycle; filtering at build time forced dynamic admission to
         // exist, and admission APPENDED tensors out of consumption order -- the
@@ -98,24 +103,19 @@ void UncondRing::produce() {
     }
     if (stream_list_.empty()) return;
 
-    // Bound the read-ahead in chunks, counted HERE: chunks enqueued and not yet
-    // settled by the consumer. It used to be the backend's in-flight count,
-    // which moves with harvest timing and so made production -- and through
-    // retention, residency and bytes -- depend on when completions happened to
-    // be polled. This count moves only at production and consumption, so the
-    // schedule is a function of the graph alone. (The old check never fired in
-    // any measured run; the arena fills first. Expert batches no longer need
-    // depth left for them: the scheduler submits urgent reads before ring reads.)
-    const size_t cap_depth = p_.io.max_in_flight();
-    const size_t depth_target = cap_depth > 16 ? cap_depth - 16 : cap_depth;
-
+    // Read ahead until the arena is full (or the next tensor is already queued).
+    // The arena is the bound, and it is deterministic: its occupancy changes only
+    // when this thread produces or consumes. There is deliberately no count-based
+    // bound on top: 41ac5bb added one (chunks outstanding until CONSUMED), and on
+    // K3 it stopped the ring on every call with most of a 1.5 GB arena empty --
+    // the drive then idled with nothing queued. Expert reads need no depth kept
+    // free for them: the scheduler submits Urgent reads before ring reads.
     size_t guard = 0;
     bool did_work = false;
     while (guard++ < stream_list_.size()) {
         // Give the scheduler the CPU first: it refills the device and routes any
         // completions, so the ring's window keeps moving between callbacks.
         p_.io.kick();
-        if (live_chunks_ >= depth_target) { ++stop_[0]; break; }
         ggml_tensor* t = stream_list_[cursor_ % stream_list_.size()];
 
         // A full lap: the next tensor is already queued and unconsumed. Deep enough.
@@ -123,7 +123,7 @@ void UncondRing::produce() {
         for (const auto& sg : queue_) {
             if (sg.t == t && !sg.consumed) { queued = true; break; }
         }
-        if (queued) { ++stop_[1]; break; }
+        if (queued) { ++stop_[0]; break; }
 
         const Source* src = p_.tensors.source_of(t);
         if (!src || p_.cache.contains(t)) { ++cursor_; continue; }
@@ -141,14 +141,14 @@ void UncondRing::produce() {
         // Wrap: segments must be contiguous, so pad the tail and place at 0.
         if (head_off_ + span > bytes_) {
             const uint64_t pad = bytes_ - head_off_;
-            if (used_ + pad + span > bytes_) { ++stop_[2]; break; }
+            if (used_ + pad + span > bytes_) { ++stop_[1]; break; }
             Segment ps;
             ps.pos = head_off_; ps.span = pad; ps.consumed = true;
             queue_.push_back(std::move(ps));
             used_ += pad;
             head_off_ = 0;
         }
-        if (used_ + span > bytes_) { ++stop_[3]; break; }
+        if (used_ + span > bytes_) { ++stop_[2]; break; }
 
         // Submit in <=8 MiB chunks: per calibration, moderate requests at depth
         // beat one giant request, and no single request occupies the drive long
@@ -171,18 +171,17 @@ void UncondRing::produce() {
             if (tag == 0) { fail = true; sg.complete = false; }
             else sg.tags.push_back(tag);
         }
-        live_chunks_ += sg.tags.size();
-        if (fail && sg.tags.empty()) { ++stop_[4]; break; }
+        if (fail && sg.tags.empty()) { ++stop_[3]; break; }
         used_ += span;
         head_off_ = (head_off_ + span) % bytes_;
         queue_.push_back(std::move(sg));
         did_work = true;
         ++cursor_;
         ++segs_;
-        if (fail) { ++stop_[4]; break; }
+        if (fail) { ++stop_[3]; break; }
     }
     // A complete lap that submitted nothing (everything resident or oversized):
-    // sleep. Depth/lap/full breaks are NOT fruitless -- work is in flight.
+    // sleep. Lap/full breaks are NOT fruitless -- work is in flight.
     if (!did_work && guard > stream_list_.size()) {
         idle_backoff_ = 256;
     }
@@ -202,7 +201,7 @@ bool UncondRing::consume(ggml_tensor* t, uint64_t* streamed) {
         // letting the producer recycle a segment the kernel could still write
         // (2026-08-24 audit).
         bool dead = false;
-        const bool settled_ok = settle_segment(sg, &dead);
+        const bool settled_ok = p_.io.settle(sg.tags, &dead);
         if (dead) retire_dead_ring();
         const bool ok = settled_ok && sg.complete;
         sg.consumed = true;
@@ -231,17 +230,12 @@ void UncondRing::retire_pending(ggml_tensor* t) {
             // retire the ring, not just this segment: outstanding DMA does not
             // care which segment the caller was touching.
             bool dead = false;
-            if (!settle_segment(sg, &dead)) sg.reads_ok = false;
+            if (!p_.io.settle(sg.tags, &dead)) sg.reads_ok = false;
             if (dead) retire_dead_ring();
             sg.consumed = true;
             break;
         }
     }
-}
-
-bool UncondRing::settle_segment(Segment& sg, bool* dead) {
-    live_chunks_ -= sg.tags.size();   // settle() clears the tags either way
-    return p_.io.settle(sg.tags, dead);
 }
 
 void UncondRing::retire_dead_ring() {
@@ -257,16 +251,16 @@ void UncondRing::append(std::ostream& o) const {
       << (queue_.empty() ? "none" : (queue_.front().t ? queue_.front().t->name : "pad"))
       << (queue_.empty() ? "" : (queue_.front().consumed ? "/consumed" : "/UNCONSUMED"))
       << ", " << segs_ << " segs, " << pops_
-      << " pops, " << calls_ << " calls; stops d=" << stop_[0]
-      << " lap=" << stop_[1] << " wrapfull=" << stop_[2]
-      << " full=" << stop_[3] << " refuse=" << stop_[4] << "), ";
+      << " pops, " << calls_ << " calls; stops lap=" << stop_[0]
+      << " wrapfull=" << stop_[1] << " full=" << stop_[2]
+      << " refuse=" << stop_[3] << "), ";
 }
 
 void UncondRing::release_all() {
     bool dead = false;
     for (auto& sg : queue_) {
         bool d1 = false;
-        settle_segment(sg, &d1);
+        p_.io.settle(sg.tags, &d1);
         dead = dead || d1;
     }
     queue_.clear();

@@ -1,3 +1,67 @@
+# The ring skipped 3-D weights that are not experts: K3 -14% (2026-09-26)
+
+After the scheduler fix, per decode token on K3 (9 GiB, 16 tokens minus a
+2-token run, High performance plan): 2.74 s waiting on routed experts, 2.72
+s on SYNCHRONOUS reads of unconditional tensors, 0.32 s on the ring, ~5.3 s
+compute. The synchronous reads were ~300 tensors/token, 1.24 GB: output.weight
+(963 MB, larger than half the ring by design), and ~190 tensors the ring
+never streamed -- K3's MLA attn_k_b/attn_v_b and KDA ssm_conv1d_{q,k,v}.
+
+Cause: the ring built its stream list with a SHAPE test, ne[2] > 1 meaning
+"expert tensor, compaction's job". Those weights are 3-D but unconditional,
+so they fell outside both the ring and compaction. The planner's class
+(Source::sliceable covers routed experts and the row-sliced embedding) is
+now the only filter -- class, never shape.
+
+  K3, 9 GiB, 16 tokens, High performance plan, ABBA, text identical:
+  shape test   12.4  12.2 s/tok   933.8 GB   stream list 1,460   sync reads 7,193
+  class        10.6  10.6 s/tok   932.8 GB   stream list 1,715   sync reads 2,809
+
+Remaining synchronous waits: the prefill pass (runs before the ring has a
+list) and output.weight once per token.
+
+---
+
+# 3.5 GB of the cap was ggml scheduler metadata nobody touched (2026-09-26)
+
+Corrects the entry below: the K3 bytes regression since 08-14 was NOT
+honest accounting.
+
+Found by asking where K3's memory goes at 12.25 GiB. The ledger showed 4.19
+GB "unreserved" (commit the engine did not allocate), with RSS 1 GB under
+the ledger total. Commit sampled after each load step: creating the llama
+context committed 4.78 GB and touched 0.68. Real buffers (KV 54 MiB,
+recurrent state 443 MiB, compute 574 MiB) explain ~1.1 GB. Halving the
+graph node budget freed 1.83 GB -- ~22 KB per node.
+
+The cause: ggml_backend_sched_new sized its split-copy context for one
+split per node with 30 inputs each (+ backend-id arrays at 61x the graph),
+~20 KB per node, malloc'd up front. A CPU graph has ONE split. At K3's node
+budget of 164,672 that is ~3.5 GB, never touched -- Windows charges it as
+commit, and the cap binds on the worse of commit and RSS, so it came out
+of the cache. (Linux/macOS never see it: untouched memory is free there,
+and our commit figure is unknown on them.) K3 got that node budget from
+fork commit 16cb54a (08-20), which "fixed" K3's dead budget branch: 20,584
+nodes -> 164,672. The bisect shows the step exactly there (9 GiB cache
+4.36 -> 1.18 GB between points 144 and 145). That commit's comment called
+the headroom "cheap in metadata (~1 MB per 2048 nodes)"; it was ~40 MB.
+
+Fix, in the fork (6a80411ef): the split context is a chain of blocks sized
+on demand (first block = previous graph's high-water mark), and the id
+arrays grow with the graph copy. The node budget itself is unchanged.
+
+  K3, 9 GiB, 16 tokens, High performance plan, ABBA, text identical:
+  before  13.0  13.2 s/tok   989.07 GB   cache budget 1.17 GB
+  after   11.9  12.4 s/tok   933.76 GB   cache budget 4.66 GB   RSS 8.56 GB
+
+933.8 GB is below the 08-14 headline build at the same cap (938.1): the
+bytes regression is gone. At 12.25 GiB the budget rose 4.22 -> 7.72 GB.
+Gates: golden text identical (26 cases; 9 counter files read equal or
+fewer bytes), fast gates, server smoke, archgate 5/5; --gpu on the testbed
+and the 35B (844 splits) byte-identical to the unfixed build.
+
+---
+
 # The I/O thread lands, and the K3 slowdown was two things, neither the streamer (2026-09-26)
 
 **K3 since the 08-14 headline.** A clean A/B (old/new/new/old, idle drive, 9 GiB,
@@ -6,10 +70,10 @@
 then run at a cap giving ~4.3 GB of cache (a given cap buys each commit a
 different budget), plus drift controls, separated two causes:
 
-- BYTES: honest accounting. The cap now covers everything the process commits,
-  so 9 GiB leaves 1.13 GB of cache where 08-14 had 4.36. At an equal budget the
-  bytes match (941.6 vs 938.1 GB). 8 GiB is now refused for K3 for the same
-  reason; the 08-14 8 GiB configuration no longer fits once memory is counted.
+- BYTES: first written as "honest accounting" -- WRONG, see the entry above.
+  The cap did shrink the cache (9 GiB left 1.13 GB where 08-14 had 4.36), and
+  at an equal budget the bytes matched (941.6 vs 938.1 GB), but what took the
+  budget was ~3.5 GB of never-touched scheduler metadata, now fixed.
 - TIME (~11%): the Vulkan backend COMPILED IN, never used. Every build before
   8583e9c (which made Vulkan an option) ran 18.1-18.8; every Vulkan-carrying
   build 19.6-20.9. Same code, CPU-only vs Vulkan-carrying, ABBA at 12.25 GiB:

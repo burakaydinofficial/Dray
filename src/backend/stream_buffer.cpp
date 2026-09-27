@@ -233,7 +233,22 @@ ggml_backend_buffer_type_t Streamer::buft() { return &impl_->buft; }
 // ---------------------------------------------------------------------------
 // materialisation
 
+// The ring producer runs inside both callbacks; its CPU time is not a wait on
+// the drive, so it is counted on its own.
+static void produce_timed(Streamer::Impl& im) {
+    const auto t0 = std::chrono::steady_clock::now();
+    im.ring.produce();
+    im.ns_produce += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+}
+
 bool Streamer::Impl::bring_in(ggml_tensor* t, uint64_t* streamed) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto took = [&](Source_ from) {
+        ns_from[from] += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        ++n_from[from];
+    };
     ring.record_consumption(t);
 
     // R13: a COMPACTED partial region (uniq non-empty: only the router-selected
@@ -253,11 +268,12 @@ bool Streamer::Impl::bring_in(ggml_tensor* t, uint64_t* streamed) {
         // hits and misses must land in ONE class or h_routed lies (Metal's
         // forced whole-tensor mode printed a hard 0% no matter the pinning).
         hits.add_for(t, ggml_nbytes(t), 0);   // served from RAM: read 0
+        took(kFromCache);
         return true;
     }
     // The ring: by now the bytes are usually already in the arena, and this is a
     // pointer assignment. On failure fall through to the synchronous read.
-    if (ring.consume(t, streamed)) return true;
+    if (ring.consume(t, streamed)) { took(kFromRing); return true; }
 
     const Source* src = tensors.source_of(t);
     if (!src) return t->data != nullptr;   // not ours
@@ -300,6 +316,8 @@ bool Streamer::Impl::bring_in(ggml_tensor* t, uint64_t* streamed) {
     // unconditional class conflated the two hit rates the readout exists to
     // keep apart. Bytes-read is unchanged; only the class split is.
     hits.add_for(t, bytes, bytes);
+    bytes_from_disk += bytes;
+    took(kFromDisk);
     return true;
 }
 
@@ -368,13 +386,27 @@ bool Streamer::needs(ggml_tensor* node) {
 bool Streamer::materialise(ggml_tensor* node) {
     const auto t_enter = std::chrono::steady_clock::now();
     struct TimeIt {
-        Streamer::Impl* im; std::chrono::steady_clock::time_point t0;
+        Streamer::Impl* im; const ggml_tensor* node; std::chrono::steady_clock::time_point t0;
         ~TimeIt() {
-            im->ns_materialise += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - t0).count();
+            im->ns_materialise += ns;
             ++im->n_materialise;
+            const int c = wait_class();
+            im->ns_wait[c] += ns;
+            ++im->n_wait[c];
         }
-    } timeit{impl_.get(), t_enter};
+        int wait_class() const {
+            if (!node) return Streamer::Impl::kWaitOther;
+            if (node->op == GGML_OP_MUL_MAT_ID) return Streamer::Impl::kWaitRouted;
+            if (node->op == GGML_OP_GET_ROWS && node->src[0] && im->tensors.is_bound(node->src[0]))
+                return Streamer::Impl::kWaitRows;
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (node->src[j] && im->tensors.is_bound(node->src[j])) return Streamer::Impl::kWaitWeights;
+            }
+            return Streamer::Impl::kWaitOther;
+        }
+    } timeit{impl_.get(), node, t_enter};
     if (!node) return true;
     Impl& im = *impl_;
     ++nodes_;
@@ -575,7 +607,7 @@ bool Streamer::materialise(ggml_tensor* node) {
     // Keep the drive fed: the ring producer replaces the old per-tensor prefetch,
     // whose admission guard was unsatisfiable below the knee (304 issues in 44,655
     // nodes). The ring's memory is its own line item, so the guard cannot starve.
-    im.ring.produce();
+    produce_timed(im);
     return ok;
 }
 
@@ -599,7 +631,7 @@ void Streamer::release(ggml_tensor* node) {
     // later adopt them mid-flight. Refusals degrade to the Phase A path.
     im.compactor.unlock_early(node);
 
-    im.ring.produce();
+    produce_timed(im);
 }
 
 // ---------------------------------------------------------------------------
@@ -786,7 +818,17 @@ std::string Streamer::report() const {
     if (im.flags.io_stats) {
         o << ", cb " << (im.ns_materialise / 1000000)
           << "ms mat/" << (im.ns_release / 1000000) << "ms rel over " << im.n_materialise
-          << " calls";
+          << " calls (mat by wait: routed " << (im.ns_wait[Impl::kWaitRouted] / 1000000)
+          << "ms/" << im.n_wait[Impl::kWaitRouted] << ", rows "
+          << (im.ns_wait[Impl::kWaitRows] / 1000000) << "ms/" << im.n_wait[Impl::kWaitRows]
+          << ", weights " << (im.ns_wait[Impl::kWaitWeights] / 1000000) << "ms/"
+          << im.n_wait[Impl::kWaitWeights] << ", other "
+          << (im.ns_wait[Impl::kWaitOther] / 1000000) << "ms/" << im.n_wait[Impl::kWaitOther] << ")"
+          << "; whole weights from cache " << (im.ns_from[Impl::kFromCache] / 1000000) << "ms/"
+          << im.n_from[Impl::kFromCache] << ", ring " << (im.ns_from[Impl::kFromRing] / 1000000)
+          << "ms/" << im.n_from[Impl::kFromRing] << ", disk " << (im.ns_from[Impl::kFromDisk] / 1000000)
+          << "ms/" << im.n_from[Impl::kFromDisk] << " (" << (im.bytes_from_disk / 1000000000.0)
+          << " GB); ring producer " << (im.ns_produce / 1000000) << "ms";
         im.io.stats().append(o);
     }
     im.repacker.append(o);

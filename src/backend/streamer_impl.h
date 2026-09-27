@@ -79,6 +79,18 @@ struct Streamer::Impl {
     uint64_t ns_materialise = 0;
     uint64_t ns_release = 0;
     uint64_t n_materialise = 0;
+    // ns_materialise split by what the node was waiting for. Time in materialise is
+    // time the compute thread is NOT computing, so this says which stream holds it.
+    enum WaitClass { kWaitRouted, kWaitRows, kWaitWeights, kWaitOther, kWaitClasses };
+    uint64_t ns_wait[kWaitClasses] = {};
+    uint64_t n_wait[kWaitClasses] = {};
+    // Where a whole weight comes from, timed (bring_in), plus the ring producer's
+    // own CPU time, which runs inside both callbacks.
+    enum Source_ { kFromCache, kFromRing, kFromDisk, kSources };
+    uint64_t ns_from[kSources] = {};
+    uint64_t n_from[kSources] = {};
+    uint64_t bytes_from_disk = 0;
+    uint64_t ns_produce = 0;
 
     // The ggml buffer type llama.cpp allocates weights from (stream_buffer_type.cpp).
     ggml_backend_buffer_type buft{};
