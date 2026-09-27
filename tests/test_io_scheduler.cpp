@@ -271,6 +271,59 @@ LZ_TEST(urgent_reads_reach_the_device_before_queued_read_ahead) {
     LZ_CHECK_EQ(r.staging(), 0u);
 }
 
+LZ_TEST(exact_reads_land_in_place_when_the_destination_is_congruent) {
+    // An expert region: slots of a 4096-multiple stride, data placed at the file
+    // offset's remainder. Each slot's aligned middle must be read straight in
+    // (no staging), the edges staged, and every byte land where it belongs.
+    Rig r({});
+    LZ_REQUIRE(r.ok);
+    const uint64_t stride = 3 * 4096, base = 5 * 4096 + 1234;   // head 1234
+    const uint32_t head = base % 4096;
+    std::vector<uint8_t> raw(4 * stride + 2 * 4096);
+    uint8_t* mem = reinterpret_cast<uint8_t*>(
+        (reinterpret_cast<uintptr_t>(raw.data()) + 4095) & ~uintptr_t(4095));
+    uint8_t* data = mem + head;
+    const int experts[4] = {7, 0, 12, 3};
+    std::vector<uint64_t> tags;
+    for (int k = 0; k < 4; ++k) {
+        const uint64_t off = base + uint64_t(experts[k]) * stride;
+        LZ_REQUIRE(r.io.submit_exact(src(1, off, stride), data + k * stride, stride, &tags));
+    }
+    LZ_CHECK_EQ(tags.size(), 12u);                  // middle + two edges, each
+    LZ_CHECK(r.io.settle(tags));
+    for (int k = 0; k < 4; ++k) {
+        LZ_CHECK(matches(data + k * stride, 1, base + uint64_t(experts[k]) * stride, stride));
+    }
+    LZ_CHECK_EQ(r.io.stats().exact_direct, 4u);
+    LZ_CHECK_EQ(r.io.stats().exact_direct_bytes, 4u * (stride - 4096));
+    LZ_CHECK_EQ(r.fake->violations(), 0u);
+    LZ_CHECK_EQ(r.staging(), 0u);
+}
+
+LZ_TEST(exact_reads_fall_back_to_staging_when_they_cannot_go_in_place) {
+    Rig r({});
+    LZ_REQUIRE(r.ok);
+    // Misaligned destination: one staged read, correct bytes.
+    std::vector<uint8_t> raw(3 * 4096 + 8192);
+    uint8_t* odd = reinterpret_cast<uint8_t*>(
+        ((reinterpret_cast<uintptr_t>(raw.data()) + 4095) & ~uintptr_t(4095)) + 7);
+    std::vector<uint64_t> tags;
+    LZ_REQUIRE(r.io.submit_exact(src(0, 4096 + 100, 3 * 4096), odd, 3 * 4096, &tags));
+    LZ_CHECK_EQ(tags.size(), 1u);
+    LZ_CHECK(r.io.settle(tags));
+    LZ_CHECK(matches(odd, 0, 4096 + 100, 3 * 4096));
+    // No aligned middle at all (a small slice): one staged read.
+    std::vector<uint8_t> small(700);
+    LZ_REQUIRE(r.io.submit_exact(src(0, 50, 700), small.data(), 700, &tags));
+    LZ_CHECK_EQ(tags.size(), 1u);
+    LZ_CHECK(r.io.settle(tags));
+    LZ_CHECK(matches(small.data(), 0, 50, 700));
+    LZ_CHECK_EQ(r.io.stats().exact_direct, 0u);
+    LZ_CHECK_EQ(r.io.stats().exact_staged, 2u);
+    LZ_CHECK_EQ(r.fake->violations(), 0u);
+    LZ_CHECK_EQ(r.staging(), 0u);
+}
+
 LZ_TEST(read_whole_lands_at_base_plus_head_and_frees_on_failure) {
     Rig r({});
     LZ_REQUIRE(r.ok);

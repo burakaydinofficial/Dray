@@ -357,6 +357,46 @@ uint64_t IoScheduler::submit_staged(const Source& s, void* dst, uint64_t bytes) 
     return enqueue(e, IoPriority::Urgent);
 }
 
+bool IoScheduler::submit_exact(const Source& s, uint8_t* dst, uint64_t bytes,
+                               std::vector<uint64_t>* tags) {
+    if (s.shard < 0 || static_cast<size_t>(s.shard) >= shards_.size()) return false;
+    const io::FileId f = shards_[static_cast<size_t>(s.shard)];
+    const uint64_t a = io_->alignment(f).max();
+    const uint64_t end = s.offset + bytes;
+    const uint64_t lo = (s.offset + a - 1) / a * a;   // first aligned byte inside
+    const uint64_t hi = end / a * a;                   // aligned end inside
+    uint8_t* mid = dst + (lo - s.offset);
+    const bool direct = hi > lo && hi - lo <= UINT32_MAX &&
+                        reinterpret_cast<uintptr_t>(mid) % a == 0;
+    if (!direct) {
+        const uint64_t t = submit_staged(s, dst, bytes);
+        if (t == 0) return false;
+        tags->push_back(t);
+        Lock lk(m_);
+        ++stats_.exact_staged;
+        return true;
+    }
+    // The middle, straight into place: no staging, no copy.
+    tags->push_back(submit_unstaged(f, lo, static_cast<uint32_t>(hi - lo), mid, 0, hi - lo));
+    // The edges (each under one alignment unit), through a bounce buffer.
+    if (lo > s.offset) {
+        const uint64_t t = submit_staged(s, dst, lo - s.offset);
+        if (t == 0) return false;
+        tags->push_back(t);
+    }
+    if (hi < end) {
+        Source tail = s;
+        tail.offset = hi;
+        const uint64_t t = submit_staged(tail, dst + (hi - s.offset), end - hi);
+        if (t == 0) return false;
+        tags->push_back(t);
+    }
+    Lock lk(m_);
+    ++stats_.exact_direct;
+    stats_.exact_direct_bytes += hi - lo;
+    return true;
+}
+
 uint64_t IoScheduler::submit_unstaged(io::FileId f, uint64_t file_offset, uint32_t len,
                                       void* dst, uint64_t head, uint64_t bytes,
                                       IoPriority prio) {
@@ -431,9 +471,7 @@ bool IoScheduler::read_batch(const std::vector<Slice>& slices) {
     // Every read enqueued before any is waited on, so the drive sees the whole
     // batch as a deep queue.
     for (const Slice& sl : slices) {
-        const uint64_t tag = submit_staged(sl.src, sl.dst, sl.len);
-        if (tag == 0) { failed = true; break; }
-        tags.push_back(tag);
+        if (!submit_exact(sl.src, sl.dst, sl.len, &tags)) { failed = true; break; }
     }
 
     // F2: settle ALL enqueued tags UNCONDITIONALLY before any discard --
@@ -557,7 +595,8 @@ void* IoScheduler::read_whole(mem::Category cat, const Source& s, uint64_t bytes
 
 void IoStats::append(std::ostream& o) const {
     o << ", io " << io_batches << " batches/" << io_slices
-      << " slices (max " << io_batch_max << "), qdepth mean "
+      << " slices (max " << io_batch_max << "), " << exact_direct << " direct reads ("
+      << exact_direct_bytes / 1000000 << " MB in place), " << exact_staged << " staged, qdepth mean "
       << (depth_n ? (depth_sum / depth_n) : 0) << " max " << depth_max
       << " min " << (depth_min == ~0ull ? 0 : depth_min)
       << " (" << depth_low << " submits found <4 in flight)";

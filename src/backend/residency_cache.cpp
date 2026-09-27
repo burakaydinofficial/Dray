@@ -1,6 +1,7 @@
 #include "backend/residency_cache.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iterator>
 
 namespace dray::backend {
@@ -38,6 +39,27 @@ bool ResidencyCache::is_protected(const ggml_tensor* t) const {
     return std::find(current_.begin(), current_.end(), t) != current_.end();
 }
 
+void* ResidencyCache::take_region(uint64_t bytes, uint32_t align) {
+    for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
+        auto r = entries_.find(*it);
+        if (r == entries_.end()) continue;
+        const Resident& e = r->second;
+        if (e.pinned || e.prio != Prio::RoutedExpert || e.bytes != bytes ||
+            e.cat != mem::Category::ExpertCache || !e.mem) continue;
+        if (align && reinterpret_cast<uintptr_t>(e.mem) % align != 0) continue;
+        if (is_protected(*it)) continue;   // needed by the node being computed
+        void* m = e.mem;
+        const ggml_tensor* victim = *it;
+        entries_.erase(r);
+        lru_.erase(std::next(it).base());
+        // As in make_room: back to the sentinel, never null.
+        const_cast<ggml_tensor*>(victim)->data = poison_.sentinel();
+        ++regions_reused_;
+        return m;
+    }
+    return nullptr;
+}
+
 bool ResidencyCache::make_room(uint64_t need) {
     for (int pass = 0; pass < 2 && mem_.cache_used() + need > mem_.cache_budget(); ++pass) {
         const Prio evictable = (pass == 0) ? Prio::RoutedExpert : Prio::Unconditional;
@@ -49,7 +71,12 @@ bool ResidencyCache::make_room(uint64_t need) {
                 if (r->second.pinned) continue;
                 if (r->second.prio != evictable) continue;   // lower-value class first
                 if (is_protected(*it)) continue;  // needed by the node being computed
+                const auto f0 = std::chrono::steady_clock::now();
                 mem_.free(r->second.cat, r->second.mem, r->second.bytes);
+                ns_evict_free_ += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - f0).count());
+                ++evictions_;
+                evicted_bytes_ += r->second.bytes;
                 const ggml_tensor* victim = *it;
                 entries_.erase(r);
                 lru_.erase(std::next(it).base());

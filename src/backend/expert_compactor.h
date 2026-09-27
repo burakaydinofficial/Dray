@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <ostream>
 #include <unordered_map>
 #include <vector>
 
@@ -77,6 +78,8 @@ public:
     void unlock_early(ggml_tensor* node);
 
     uint64_t early_unlocks() const { return early_unlocks_; }
+    // IO_STATS: time inside Phase C and in region room/allocation.
+    void append_timing(std::ostream& o) const;
 
     // Teardown: every pending region's DMA must complete before its memory may
     // be freed; a region whose backend died is leaked, loudly.
@@ -93,6 +96,7 @@ private:
         std::vector<uint64_t> tags;    // outstanding reads
         std::vector<size_t>   miss;    // slots that came from DISK (bytes accounting
                                        // and eslot admission)
+        uint32_t              head = 0;   // data starts at mem + head (alloc_region)
     };
     // The expert tensors one ids tensor unlocks, learned at first compaction.
     struct ExpertTrio {
@@ -105,6 +109,14 @@ private:
     }
     void submit_sibling_region(ggml_tensor* w, const std::vector<int32_t>& uniq);
     void submit_layer_siblings(ggml_tensor* w, const std::vector<int32_t>& uniq);
+    // Room for a region of `need` bytes of expert slots, placed so each slot can
+    // take its expert's aligned middle as a DIRECT read (IoScheduler::submit_exact):
+    // the data starts at mem + head, head = the tensor's file offset modulo the
+    // alignment, which every expert shares when the on-disk stride is a multiple
+    // of it (K3, GLM: all of them). Otherwise head is 0 and reads are staged, as
+    // before. Evicts through make_room. False = no room.
+    bool alloc_region(const Source& src, uint64_t stride, uint64_t need,
+                      uint8_t** mem, uint64_t* bytes, uint32_t* head);
 
     Parts                        p_;
     const StreamFlags&           flags_;
@@ -113,6 +125,7 @@ private:
     std::unordered_map<const ggml_tensor*, PendingRegion> pending_;
     std::unordered_map<const ggml_tensor*, ExpertTrio>    trio_by_ids_;
     uint64_t early_unlocks_ = 0;
+    uint64_t ns_unlock_ = 0, ns_room_ = 0, ns_alloc_ = 0;
     int      traced_ = 0;   // DRAY_TRACE_COMPACT lines printed so far
 };
 

@@ -103,6 +103,10 @@ public:
     const Entries& entries() const { return entries_; }
     size_t         size() const { return entries_.size(); }
     size_t         lru_size() const { return lru_.size(); }
+    // Evictions and the time spent freeing their memory (IO_STATS).
+    uint64_t       evictions() const { return evictions_; }
+    uint64_t       evicted_bytes() const { return evicted_bytes_; }
+    uint64_t       ns_evict_free() const { return ns_evict_free_; }
 
     // An entry that never enters the LRU: the mandatory floor, and tensors
     // llama.cpp owns. Replaces any existing entry for `t`.
@@ -118,6 +122,15 @@ public:
     // back at the sentinel. True when the bytes now fit.
     bool make_room(uint64_t need);
     bool reclaim(uint64_t bytes) override { return make_room(bytes); }
+
+    // Hands over the memory of a dead routed-expert region of EXACTLY `bytes`
+    // (least recent first, never pinned or protected), removing it from the
+    // cache without freeing it. Its ledger charge carries over unchanged to the
+    // caller's new region -- same category, same bytes -- so the cap accounting
+    // is untouched, and the pages are neither decommitted nor recommitted: a
+    // free+alloc per region cost K3 30 s per 16-token run. Null when none fits.
+    void* take_region(uint64_t bytes, uint32_t align);
+    uint64_t regions_reused() const { return regions_reused_; }
 
     // Rebudget support. When the budget contracts under them, static pins become
     // an over-claim nothing can evict (measured on Linux: 3.27 GB pinned of 2.39
@@ -138,6 +151,8 @@ public:
     void release_all();
 
 private:
+    uint64_t evictions_ = 0, evicted_bytes_ = 0, ns_evict_free_ = 0;
+    uint64_t regions_reused_ = 0;
     AccountedAlloc&               mem_;
     const PoisonBuffers&          poison_;
     const TensorRegistry&         tensors_;

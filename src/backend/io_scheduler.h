@@ -106,6 +106,8 @@ struct IoStats {
     uint64_t memcpy_ns = 0, memcpy_bytes = 0;
     uint64_t stage_alloc_ns = 0, stage_alloc_n = 0;
     uint64_t io_batches = 0, io_slices = 0, io_batch_max = 0;
+    // submit_exact: reads served straight into place vs through a bounce buffer.
+    uint64_t exact_direct = 0, exact_direct_bytes = 0, exact_staged = 0;
     // Who polled. Without the I/O thread a poll gap is the compute thread's
     // ABSENCE (reads finished, nobody collected them -- the 2026-08-24 defect).
     // With it, a gap is the I/O thread IDLE: nothing queued, nothing in flight,
@@ -166,6 +168,14 @@ public:
     // widened to the shard's alignment). 0 = not started: the staging could not
     // be allocated even after reclaiming, or the shard is unknown.
     uint64_t submit_staged(const Source& s, void* dst, uint64_t bytes);
+    // Enqueues a read of exactly `bytes` of `s` into `dst`, WITHOUT a bounce buffer
+    // where possible: the alignment-sized middle is read straight into `dst`, and
+    // only the two sub-alignment edges go through staging. That needs the middle's
+    // address aligned, i.e. dst congruent to s.offset modulo the alignment (expert
+    // regions place their data at that offset); otherwise -- or when there is no
+    // aligned middle -- it is one staged read, exactly submit_staged. Appends 1-3
+    // tags; false = not started (tags already appended must still be settled).
+    bool submit_exact(const Source& s, uint8_t* dst, uint64_t bytes, std::vector<uint64_t>* tags);
     // Enqueues one read straight into `dst`, which the caller has already
     // widened and aligned. The read succeeds when the device returns at least
     // head + bytes. Not sampled into the depth statistics. Never refused.

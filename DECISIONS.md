@@ -1,3 +1,76 @@
+# Dead expert regions are reused, not freed and reallocated (2026-09-27)
+
+After direct reads, the K3 release callbacks (Phase C, where a layer's expert
+regions are allocated) were the next visible cost: at 9 GiB a 16-token run
+evicts ~6,300 regions (~259 GB), each a free (decommit) and a fresh commit.
+ResidencyCache::take_region now hands a dead routed-expert region of exactly
+the needed size to the new owner instead: removed from the cache and pointed at
+the sentinel like any eviction, its ledger charge carried over unchanged, its
+pages never decommitted. It is used ONLY where a fresh allocation would have
+had to evict -- the first version also took regions while there was free room,
+throwing away reusable cached experts for nothing; test_pressure caught it (a
+smaller cache at its rebudget, then a cap breach). Never pinned, protected,
+unconditional, differently sized or wrongly aligned regions
+(test_region_reuse, mutation-checked).
+
+  K3 9 GiB, 16 tokens, High performance, neighbour agent active, interleaved:
+  direct            8.9  8.8  9.0 s/tok   917.03 GB
+  direct + reuse    8.7  8.6  8.7 s/tok   916.6-917.03 GB
+  4,432 regions reused in place per run; text identical in all runs.
+
+A small gain (~2.5%), but outside the run-to-run range. Confirmed on GLM 5.3 Flash
+(8 GiB, 32 tokens, same conditions, built on the GLM-capable fork base that is
+not pinned yet), 3 interleaved runs each, mean rate incl. prefill:
+  staged 2.8 2.8 2.8 | direct 1.9 2.2 2.2 | direct + reuse 1.9 1.8 1.8 s/tok
+  routed wait 28-29 s -> 8.4-9.0 s; 100.256 GB and identical text in all nine. Also new under
+DRAY_IO_STATS: time inside Phase C, region room/allocation time, evictions
+and the time spent freeing them.
+
+---
+
+# Expert reads land in place, without a bounce buffer (2026-09-27)
+
+The I/O thread copied 220 GB of staged expert reads into their regions over one
+K3 run (9 GiB, 16 tokens) -- ~13.8 GB per token of pure memory traffic. The
+staging existed because unbuffered reads need aligned offsets, lengths and buffers, while an expert's bytes must land at the
+region's stride.
+
+But every expert stride on K3 and GLM 5.3 Flash is a multiple of 4096 (K3
+6,451,200 = 1575 x 4096), so all experts of a tensor share one offset
+remainder h. A region now places its data at mem + h
+(ExpertCompactor::alloc_region), and IoScheduler::submit_exact reads each
+expert's aligned middle straight into its slot; only the two sub-4 KiB edges go
+through staging. Unaligned strides, unaligned destinations and slices without
+an aligned middle fall back to one staged read, exactly as before.
+
+  K3, 9 GiB, 16 tokens, text identical (deterministic figures only):
+  staged   932 GB read   220 GB copied through staging
+  direct   916 GB read   2.9 GB copied through staging (edges only)
+
+TIMINGS WITHDRAWN (same day). This entry first quoted decode 17.5/17.4 ->
+13.7/15.0 s/tok, routed wait 124.6 -> 34.0 s and memcpy 74 -> 0.8 s. Those
+runs (11:21-11:45) overlapped other agents working on the same machine
+(owner, 12:35), which breaks the exclusive-drive rule invisibly; they are not
+evidence. The bytes and the copy volume above are deterministic and stand; the
+speed-up was re-measured the same afternoon (below). The commit message of
+56d64df carries the withdrawn figures.
+
+  RE-MEASURED, K3 9 GiB, 16 tokens, High performance plan, the neighbour agent
+  still active (small bursts) -- so three interleaved runs each, ranges shown:
+  staged (abebf8f)   10.3  11.4  10.8 s/tok   919-934 GB (varies run to run)
+  direct (56d64df)    8.9   8.8   9.0 s/tok   917.03 GB
+  -18% decode; text identical in all runs. The staged build's bytes vary
+  because in-flight staging holds cache room for a timing-dependent time;
+  direct reads hold almost none, so their bytes are near-deterministic.
+
+Fewer bytes too: in-flight staging no longer holds ~6.5 MB per expert read, so
+the cache keeps that room. Found on the way, both fixed: on_get_tensor and
+self_check read a resident tensor from mem instead of mem + head, so any whole
+tensor placed at a widened span read back shifted (self_check would have
+reported false mismatches; get_tensor served wrong bytes).
+
+---
+
 # The ring skipped 3-D weights that are not experts: K3 -14% (2026-09-26)
 
 After the scheduler fix, per decode token on K3 (9 GiB, 16 tokens minus a

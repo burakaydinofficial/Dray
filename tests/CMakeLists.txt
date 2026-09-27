@@ -63,6 +63,8 @@ dray_add_test(pressure)
 dray_add_test(readout)
 dray_add_test(two_shard)
 dray_add_test(residency)
+# ResidencyCache::take_region: region reuse must behave exactly as an eviction.
+dray_add_test(region_reuse)
 dray_add_test(storage)
 # Differential check on expert compaction: the streamer's central trick, and the
 # one place where being wrong yields fluent text from the wrong weights rather

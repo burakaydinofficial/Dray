@@ -115,7 +115,10 @@ ggml_status Streamer::Impl::on_init_tensor(ggml_tensor* t) {
 void Streamer::Impl::on_get_tensor(const ggml_tensor* t, void* data, size_t offset, size_t size) {
     const Resident* r = cache.find(t);
     if (r && r->mem) {
-        std::memcpy(data, static_cast<const uint8_t*>(r->mem) + offset, size);
+        // The tensor's bytes start at mem + head (whole reads are allocated at the
+        // alignment-widened span); reading from mem itself returned bytes shifted
+        // by head for every such tensor.
+        std::memcpy(data, static_cast<const uint8_t*>(r->mem) + r->head + offset, size);
         return;
     }
     // Zeros presented as data, silently, was the worst available behaviour: any
@@ -674,13 +677,17 @@ Streamer::SelfCheck Streamer::self_check(size_t max_tensors) {
 
         // Through the fresh handle, with read_exact's alignment widening reused
         // verbatim.
-        buf.assign(static_cast<size_t>(r.bytes), 0);
+        // The tensor's own bytes, at mem + head: a whole read is allocated at the
+        // alignment-widened span (r.bytes) with the tensor starting `head` in.
+        buf.assign(static_cast<size_t>(s.bytes), 0);
         const bool got = im.io.read_exact_via(refs[static_cast<size_t>(s.shard)], s,
-                                              buf.data(), r.bytes);
+                                              buf.data(), s.bytes);
         if (!got) continue;
 
         ++out.checked;
-        if (std::memcmp(buf.data(), r.mem, buf.size()) != 0) ++out.mismatched;
+        if (std::memcmp(buf.data(), static_cast<const uint8_t*>(r.mem) + r.head, buf.size()) != 0) {
+            ++out.mismatched;
+        }
     }
 
     for (io::FileId f : refs) if (f != io::kInvalidFile) im.io.close_file(f);
@@ -830,6 +837,10 @@ std::string Streamer::report() const {
           << "ms/" << im.n_from[Impl::kFromDisk] << " (" << (im.bytes_from_disk / 1000000000.0)
           << " GB); ring producer " << (im.ns_produce / 1000000) << "ms";
         im.io.stats().append(o);
+        im.compactor.append_timing(o);
+        o << ", evictions " << im.cache.evictions() << " (" << im.cache.evicted_bytes() / 1000000000.0
+          << " GB, " << im.cache.ns_evict_free() / 1000000 << "ms freeing), "
+          << im.cache.regions_reused() << " regions reused in place";
     }
     im.repacker.append(o);
     im.hits.append(o);
