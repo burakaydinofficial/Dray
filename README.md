@@ -54,20 +54,19 @@ token. Below some byte rate the engine is the limit and the SSD is idle
 capacity you already paid for. If your model is in that regime, a faster drive
 buys nothing.
 
-AND ON THE LARGE MODELS THE DRIVE IS NOT THE LIMIT EITHER, which is worse.
+On the large models the drive IS now the limit, which is where it should be.
 Calibrated on Kimi K3's own fourteen shards this NVMe serves 2 MiB random reads
-at 6.03 GB/s. The engine achieves 1.8. The reason, measured 2026-08-24: the I/O
-path only runs between compute nodes, because the thread that submits and
-harvests reads is the thread that computes. Of a 121 second run about 91
-seconds has nobody polling the completion queue. So a faster drive buys nothing
-here either, until that is fixed. It is written up in DECISIONS with the
-instrumentation to judge any attempt.
+at 6.03 GB/s. Until late September the engine achieved 1.8, because the thread
+that submitted and collected reads was the thread that computed; a dedicated I/O
+thread, expert reads that land in place, and reuse of expert memory brought K3
+at a 9 GiB cap to about 5.9 GB/s. DECISIONS.md has the steps and the
+measurements; the table below predates them and will be re-measured whole.
 
 ## Measured status (2026-08-23)
 
-Every number below is from DECISIONS.md, the lab notebook this repository
-carries; where a figure has a producing commit recorded there, the notebook
-names it.
+Every number below was measured on the machine described in DECISIONS.md, the
+lab notebook this repository carries; the per-cell data is in
+`scripts/matrix-results.csv`.
 
 | model | disk | cap | decode | bytes/token |
 |---|---|---|---|---|
@@ -262,10 +261,10 @@ fluent text from wrong weights is worse than not serving.
 
 ## Design notes
 
-DECISIONS.md is the project's lab notebook: every measurement with its commit, every
-correction with its cause, every open question with the experiment that would settle
-it. CLAUDE.md holds the architecture and its eight invariants. Models never live in
-this repository.
+DECISIONS.md is the project's lab notebook: what was measured and under which
+conditions, every correction with its cause, and the questions still open. CLAUDE.md
+holds the architecture and its eight invariants. Models never live in this
+repository.
 
 ## Licence
 

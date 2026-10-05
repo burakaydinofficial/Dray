@@ -42,7 +42,7 @@ model fits the cap) reaches parity with stock llama.cpp; --force-stream pins the
 streaming path and every gate uses it.
 
 Correctness is sealed on Windows/Linux/macOS at identical node counts; the
-reference performance numbers are Windows (DECISIONS.md, with commits). The
+reference performance numbers are Windows (DECISIONS.md). The
 OpenAI-compatible server ships with background jobs and crash-resume. Earlier
 batch figures for the large flagships (2026-08-19, same conditions): K3 5.45x at
 width 32, Qwen 3.77x at 16, GLM 2.55x at 44 with `--kv q4`. The MULTIPLIER rises
