@@ -15,6 +15,8 @@ engine::EngineConfig engine_config_from(const Args& a) {
     ec.n_threads     = a.n_threads;
     ec.force_stream  = a.force_stream;
     ec.resident      = a.resident;
+    ec.config_dir    = a.config_dir;
+    ec.vram_cap      = a.vram_cap;
     return ec;
 }
 

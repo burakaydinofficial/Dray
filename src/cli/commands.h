@@ -8,9 +8,9 @@
 namespace dray::cli {
 
 int cmd_plan(const Args& a);           // residency plan + RAM curve, no load
+int cmd_config(const Args& a);        // effective settings and their sources
 int cmd_calibrate(const Args& a);      // drive bandwidth per traffic class
 int cmd_verify(const Args& a);         // uncached reads vs an independent reference
-int cmd_stream(const Args& a);         // I/O-only decode simulation (legacy ExpertCache)
 int cmd_run(const Args& a);            // one generation with the live readout
 int cmd_run_reference(const Args& a);  // --no-stream: llama.cpp loads normally (difftest reference)
 int cmd_batch(const Args& a);          // lockstep batched decode, optional cohort rotation

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 
+#include "ggml-cpu.h"
 #include "llama.h"
 
 #include "backend/stream_buffer.h"
@@ -19,6 +20,8 @@ namespace dray::engine {
 // built from, then the streamer and the ledger it charges, then the backend.
 Engine::~Engine() {
     if (lctx_) llama_free(lctx_);
+    if (tp_prefill_ && tp_prefill_ != tp_decode_) ggml_threadpool_free(tp_prefill_);
+    if (tp_decode_) ggml_threadpool_free(tp_decode_);
     if (model_) llama_model_free(model_);
     if (meta_) backend::free_merged_metadata(*meta_);
     streamer_.reset();
@@ -45,6 +48,11 @@ std::string Engine::streamer_report() const   { return streamer_->report(); }
 std::string Engine::accountant_report() const { return streamer_->accountant_report(); }
 uint64_t Engine::failures() const             { return streamer_->failures(); }
 uint32_t Engine::funded_sequences() const     { return plan_->n_seq; }
+uint64_t Engine::spare_cache_bytes() const     { return streamer_ ? streamer_->spare_cache_bytes() : 0; }
+uint64_t Engine::recurrent_state_per_sequence() const {
+    const uint32_t n = plan_->n_seq ? plan_->n_seq : 1;
+    return plan_->floor.recurrent_state / n;
+}
 bool Engine::weights_failed() const           { return streamer_->aborted(); }
 
 void Engine::latch_over_cap() {

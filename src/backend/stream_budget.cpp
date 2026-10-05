@@ -8,17 +8,13 @@ namespace dray::backend {
 
 namespace {
 
-bool is_token_embd(const plan::TensorInfo& t) {
-    return t.name.find("token_embd") != std::string::npos;
-}
-
-// The unconditional stream: bulk weights read every token, less the row-sliced
-// embedding (only a few rows of it are ever read).
+// The unconditional stream: bulk weights read every token. Row-sliced tables are
+// their own class (only a few rows are ever read); a TIED embedding is bulk,
+// because it is also the output projection and is read whole.
 uint64_t uncond_stream_bytes(const plan::Plan& p) {
     uint64_t sum = 0;
     for (const plan::TensorInfo& t : p.tensors) {
         if (t.cls != plan::TensorClass::UnconditionalBulk) continue;
-        if (is_token_embd(t)) continue;
         sum += t.bytes;
     }
     return sum;
@@ -75,7 +71,7 @@ uint64_t widest_whole_tensor(const plan::Plan& p) {
         if (t.cls == plan::TensorClass::RoutedExpert) continue;   // compacted
         if (t.cls == plan::TensorClass::RouterGate) continue;     // pinned floor
         if (t.cls == plan::TensorClass::NormOrBias) continue;     // pinned floor
-        if (is_token_embd(t)) continue;                           // row-sliced
+        if (t.cls == plan::TensorClass::RowSliced) continue;      // row-sliced
         widest = std::max(widest, t.bytes);
     }
     return widest;
@@ -102,6 +98,7 @@ StreamBudget size_stream(const plan::Plan& p, const Config& cfg, uint32_t align,
     // whole tensors starves eviction: static pinning fills the budget, nothing
     // is evictable, and the fallback fails.
     const uint64_t uniq_w = union_experts(p, cfg);
+    b.funded_union = uniq_w;
     uint64_t churn = 0;
     for (const plan::LayerSlotClass& sc : p.slot_classes) {
         churn = std::max<uint64_t>(churn, sc.slot_bytes * uniq_w * 3ull);
@@ -180,12 +177,13 @@ StreamBudget size_stream(const plan::Plan& p, const Config& cfg, uint32_t align,
     }
     b.eslot_headroom = budget_est;
     b.eslot_reserved = uncond + churn + routed_whole + routed_whole / 4;
-    // Batch: eslot admission is single-stream-only (measured, see the admission
-    // site), so a committed pool under batch is budget that can never earn a hit
-    // -- and at caps where the unconditional set fully fits, that dead
-    // commitment strangled make_room (M3 28G B=16: budget 12.30, in_use 12.21,
-    // need 0.70, nothing evictable; NO_ESLOTS cleared it). No width, no pool.
-    b.eslot_enabled = !(cfg.n_seq > 1);
+    // At every width. It used to be off for n_seq > 1: an UNEVICTABLE committed
+    // pool strangled make_room at caps where the unconditional set fully fits
+    // (M3 28G B=16: budget 12.30, in_use 12.21, need 0.70, nothing evictable).
+    // Slots are evictable now -- make_room asks the pool back before it touches
+    // unconditional weights (ResidencyCache::SpillSource) -- so a pool can no
+    // longer starve a region, and parallel serving keeps its expert cache.
+    b.eslot_enabled = true;
     return b;
 }
 

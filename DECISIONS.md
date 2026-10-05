@@ -82,6 +82,12 @@ cache. The vendored fork now sizes it on demand. K3 at 9 GiB: cache budget 1.17 
 4.66 GB, 989 -> 934 GB read. (Linux and macOS never saw it: untouched memory is free
 there.)
 
+**The expert frequency cache is evictable and bounded by bytes.** It holds hot
+experts in RAM between tokens, gives memory back to the main cache under pressure
+(coldest first), and admits by bytes rather than a count, so it stays on at every
+batch width. Flash Next at width 2: -46% decode bytes; MiniMax-M3 at 28 GiB and width
+16, which used to fail, completes.
+
 **Measured minimum caps** (correct text required; below them the engine refuses at
 load and names a cap that works): Qwen3.6 35B-A3B 3 GiB, Qwen3.5 122B-A10B 3 GiB,
 DeepSeek V4 Flash 3 GiB, Qwen3.8-27B dense 4 GiB (1-bit: 3 GiB), MiniMax-M3 4 GiB,
@@ -182,8 +188,25 @@ drive. Growing the ring beyond its default buys nothing: it is consumer-limited.
   streams more than a few GB per token.
 - **Thread oversubscription.** ggml's pool spin-waits; with the engine's own threads
   on top, requesting all 22 threads ran about 40x slower. The pool is clamped to
-  (cores - 9); decode defaults to 4 threads (flat above that, bandwidth-bound),
-  prefill to the clamp.
+  (cores - 9); decode defaults to 4 threads, prefill to the clamp.
+- **Decode threads: more is slower on small-active models.** Decode s/token by
+  thread count (CPU build, High performance plan, interleaved 4-3-2-1-1-2-3-4):
+
+  | model | 1 | 2 | 3 | 4 |
+  |---|---|---|---|---|
+  | 1B-7B testbed, 8 GiB | 0.107 | 0.166 | 0.200 | 0.235 |
+  | Qwen3.6 35B-A3B, 12 GiB | 0.31 | 0.43-0.54 | | 0.67-0.80 |
+  | Qwen3.8-27B dense, 16 GiB | 1.51 | 1.29 | 1.27 | 1.28 |
+  | Kimi K3, 9 GiB | 11.6 | 9.6 | 9.3 | 9.1 |
+
+  The default of 4 is the slowest choice on the two small-active models and the
+  right one on K3. The cost is ggml's own compute of each claimed node (35B, 40
+  tokens: 62 vs 184 us per node on 1 vs 4 threads, the engine's callbacks
+  unchanged): one node is too little work to pay for waking and joining a pool.
+  Not the cause, measured: thread creation (a persistent pool, attached as stock
+  llama.cpp does, changes nothing), the pool's polling level, pinning to
+  performance cores, `DRAY_FAST_NODES`. The best count depends on the model's work
+  per node on a given machine; `threads.decode` is a machine setting today.
 - **Resident mode.** When the whole model fits the cap, llama.cpp allocates it
   natively. It is correct and much faster than streaming the same model, but still
   21-46% slower than stock llama.cpp (see the README table); if a model fits, use
@@ -197,15 +220,53 @@ drive. Growing the ring beyond its default buys nothing: it is consumer-limited.
 
 ## GPU (`--gpu`, opt-in at build and run time)
 
-- **Decode loses** on every model measured (15 of 15 pairs): weights live in host
-  memory, so offloaded decode drags them across PCIe every token.
-- **Prefill wins** by 12-72x: a 6,594-token prompt on a 27B takes 22 s instead of
-  47 minutes. The KV cache stays in RAM and weights never move to VRAM; ggml offloads
-  only large-batch ops, so prefill goes to the GPU and decode does not.
-- **It raises the minimum cap**, because the Vulkan compute buffer is inside it.
-- **Vulkan is a build-time opt-in** (2026-09-26): merely compiling the Vulkan backend
-  in cost K3 about 11% on CPU runs (ggml initialises it eagerly), so the default
-  build is CPU-only and `--gpu` refuses on it with instructions.
+The GPU is used for prefill only: weights stay in host memory, the KV cache stays in
+RAM, and ggml offloads only large-batch ops, so decode stays on the CPU.
+
+- **Streamed `--gpu` computed on garbage until 2026-09-30.** ggml's scheduler copies a
+  GPU split's weights straight from host memory *before* the eval callback that
+  streams them in runs, so a weight not yet loaded went to the GPU as the poison
+  sentinel: wrong text with exit 0 on every streamed model, and a crash on a
+  512-expert model. The fork now calls back around each such copy and the engine
+  loads the weight first. `scripts/gpugate.ps1` proves streamed `--gpu` bit-identical
+  to llama.cpp's own GPU path (resident mode, repacked kernels and Vulkan fusion off on
+  both legs; not the CPU, whose q8 activations flip near-ties). Every earlier GPU
+  prefill figure is withdrawn (see Corrections).
+- **Copies read only the routed experts.** The scheduler copies only the experts a
+  split routes to; the copy now reads only those (whole tensors when every routed
+  tensor fits the cache). GPU prefill reads the same bytes as CPU prefill: Qwen3.8
+  Flash Next 547 -> 325.6 GB for a 2.3k-token prompt (CPU 325.5).
+- **Copies land in pinned memory and read ahead.** Unpinned source memory costs a
+  staging memcpy and a device synchronise per copy. Routed experts now land in host
+  memory from the GPU device's own host buffer type, one slot per expert kind, and a
+  layer's other two expert tensors (same routing) are read ahead while one is copied.
+  Qwen3.6 35B-A3B at 12 GiB, 2.3k-token prompt, same bytes and text: 123/94 s ->
+  34/34 s. The slots (562 MiB there) are charged to the cap.
+- **First corrected figure.** Same model and cap, 2.3k-token prompt, default settings
+  (the automatic VRAM limit settled on 1024-token chunks), High performance plan:
+  generation starts at 16.8 s with `--gpu` against 133.9 s on CPU, both including
+  about 5 s of load -- roughly 10 s of prefill against 129 s, reading 66.6 GB against
+  105.6. Copies then run near the laptop's PCIe rate, so the remaining cost is bytes
+  over PCIe, which fall with chunk size. Qwen3.8-27B dense at 16 GiB, same prompt:
+  32-33 s against 707 s (about 25x on prefill), but 71.1 GB read against 54.5 -- a
+  dense model's every weight is copied per chunk, while the CPU path keeps part of
+  it cached.
+- **A hard VRAM limit, like the cap.** `gpu.vram_cap` (system settings, a size) or
+  `--vram-cap`; unset, a quarter of the card (half on a card of at most 2 GiB). The
+  prefill chunk is halved until the GPU context fits, or the run is refused with the
+  VRAM it needs.
+- **Context-sized work stays with a KV cache kept in RAM** when VRAM requires it:
+  attention and sparse-attention indexer scores against every cached key are sized by
+  the context, reserved for a full one. With the fork's opt-in scheduler rule those
+  ops run on the CPU beside the cache; it costs about 25% at 8k context, so it is used
+  only when it is what makes a chunk fit (Flash Next, 2 x 600k context in 1.94 GiB:
+  chunk 32 -> 512).
+- **It raises the minimum cap**, because the pinned copy slots are inside it.
+- **Vulkan only wakes when asked.** Merely initialising the Vulkan backend costs CPU
+  decode 25-30% (Flash Next: 1.83 vs 2.23 s/token, same bytes; not power, buffers or
+  I/O -- the same work takes more CPU time). Vulkan is a build-time opt-in, and a
+  Vulkan build without `--gpu` now disables it for its own process before any ggml
+  call. With `--gpu`, decode still pays it (open).
 
 ---
 
@@ -231,8 +292,20 @@ distinct prompts, decode bytes only (full table in the README):
 - **Cohort rotation** (`--rotate`, opt-in) serves more prompts than the cap funds by
   running cohorts to completion, parking state to a directory the user chooses; it is
   the engine's only sustained-write feature and reports its write bytes.
-  Mid-generation parking is refused: llama.cpp's per-sequence state restore was
-  measured nondeterministic.
+  Mid-generation parking is still refused until it has its own gate, although
+  per-sequence state restore has since measured bit-exact (attention and recurrent).
+
+**Serving.** `serve` runs a continuous-batching scheduler: `serve.max_parallel` slots,
+each with its own KV funded at load inside the cap, one decode step carrying every
+generating slot plus a bounded share of prompt tokens. With no slot decoding, a prompt
+goes in full-size steps -- each step re-reads the experts its tokens route to, so a
+4.4k-token prompt in 256-token steps cost Flash Next 922 s on CPU. Conversations are
+reused by token prefix regardless of connection: kept in their slot (attention KV cut
+back to the shared prefix, recurrent state restored from checkpoints taken just before
+the prompt end), or parked whole in a pool outside the slots with a token budget,
+idle expiry and LRU. A restored conversation answers exactly what it would have
+without leaving its slot. Tool calls and reasoning go through the model's own chat
+template (llama.cpp's chat library).
 
 ---
 
@@ -267,6 +340,9 @@ measured per model, not assumed. `--kv q4` does not work on Kimi K3 at all
 
 ## Corrections worth knowing
 
+- **"`--gpu` prefill is 12-72x faster; a 6,594-token prompt takes 22 s"** --
+  withdrawn: every streamed `--gpu` run computed on garbage until 2026-09-30 (see
+  GPU). Correct GPU prefill figures are being re-measured.
 - **"Resident mode reaches parity with stock llama.cpp"** -- it does not; stock is
   21-46% faster when a model fits.
 - **"Kimi K3 runs at 8 GiB at 16.1 s/token, 6 GiB minimum"** -- not reproducible once
@@ -296,6 +372,13 @@ measured per model, not assumed. `--kv q4` does not work on Kimi K3 at all
   restart.
 - A VRAM pool for per-sequence state would move the batch-width bound off RAM.
 - Metal needs windowed materialisation to reach its measured 4.1x MoE prefill.
+- With `--gpu`, decode is about 30% slower than without (the same CPU work takes more
+  CPU time once Vulkan is initialised): ~27% at every thread count, in-process only
+  (a separate process holding Vulkan costs ~2%). The cause needs a CPU profile.
+- The right `threads.decode` is model-dependent (1 on small-active models, 4 on K3);
+  one machine-wide default cannot be right for both.
+- GPU prefill still runs one split per host-resident weight, each synchronised;
+  grouping weights per split under the VRAM limit is the next lever.
 
 ---
 

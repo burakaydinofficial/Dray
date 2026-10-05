@@ -59,6 +59,7 @@ TensorClass expected_class(FixtureClass c) {
         case FixtureClass::NormOrBias:        return TensorClass::NormOrBias;
         case FixtureClass::RoutedExpert:      return TensorClass::RoutedExpert;
         case FixtureClass::UnconditionalBulk: return TensorClass::UnconditionalBulk;
+        case FixtureClass::RowSliced:         return TensorClass::RowSliced;
     }
     return TensorClass::UnconditionalBulk;
 }
@@ -234,6 +235,7 @@ LZ_TEST(byte_totals_split_the_unconditional_stream_from_the_routed_population) {
 
     LZ_CHECK_EQ(p.routed_bytes, fx.routed_bytes);
     LZ_CHECK_EQ(p.unconditional_bytes, fx.unconditional_bytes);
+    LZ_CHECK_EQ(p.row_sliced_bytes, fx.row_sliced_bytes);
     LZ_CHECK_EQ(p.n_moe_layers, fx.n_moe_layers);
     LZ_CHECK_EQ(p.n_experts, fx.spec.n_experts);
     LZ_CHECK_EQ(p.n_expert_used, fx.spec.n_expert_used);

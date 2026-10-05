@@ -17,12 +17,15 @@
 #include "engine/batch_generator.h"
 #include "engine/cohort_rotator.h"
 #include "engine/engine.h"
+#include "engine/llama_stepper.h"
+#include "engine/scheduler.h"
 
 namespace dray::cli {
 
-// Batched offline decode: N prompts, lockstep steps, one shared stream. The
-// server stays serialized (Invariant 7); this is the throughput operating
-// point the projection table models, and the run that grades that table.
+// Batched offline decode: N prompts, lockstep steps, one shared stream -- the
+// throughput operating point the projection table models, and the run that
+// grades that table. The server gets the same economics from engine::Scheduler
+// (serve --parallel); DRAY_BATCH_SCHEDULER=1 runs this command through it.
 int cmd_batch(const Args& a) {
     namespace srv = dray::engine;
     if (a.n_batch_seq < 1) { std::fprintf(stderr, "batch: --batch must be >= 1\n"); return 1; }
@@ -118,6 +121,7 @@ int cmd_batch(const Args& a) {
                                static_cast<unsigned long long>(fails));
         const bool over = eng->live_over_cap();
         if (over) std::printf("  *** CAP BREACH occurred during this run ***\n");
+        std::fprintf(stderr, "%s\n", eng->streamer_report().c_str());
         std::printf("\n%s\n", eng->accountant_report().c_str());
         eng.reset();
         return (!any_bad && fails == 0 && !over) ? 0 : 1;
@@ -139,7 +143,45 @@ int cmd_batch(const Args& a) {
                          (ecs.bytes_streamed - ec_open.bytes_streamed) / 1e9);
         }
     };
-    srv::BatchResult br = srv::BatchGenerator(*eng).run(bp);
+    // DRAY_BATCH_SCHEDULER=1: the same prompts through the continuous-
+    // batching scheduler (all submitted at once, driven synchronously). With
+    // prompts that fit one step it builds the same steps as BatchGenerator,
+    // so the output must be identical -- that is the check this lever exists for.
+    const bool via_scheduler = [] {
+        const char* v = std::getenv("DRAY_BATCH_SCHEDULER");
+        return v && v[0] == '1';
+    }();
+    srv::BatchResult br;
+    if (via_scheduler) {
+        srv::LlamaStepper stepper(*eng);
+        srv::Scheduler::Config scfg;
+        scfg.prefill_tokens_per_step = eng->prefill_chunk();
+        srv::Scheduler sched(stepper, scfg);
+        br.seqs.resize(bp.prompts.size());
+        for (size_t s = 0; s < bp.prompts.size(); ++s) {
+            srv::Request q;
+            q.params.prompt = bp.prompts[s];
+            q.params.max_tokens = bp.max_tokens;
+            q.params.temperature = bp.temperature;
+            q.params.seed = (bp.seed ? bp.seed : 1234u) + static_cast<uint32_t>(s);   // as BatchGenerator
+            q.params.stop = bp.stop;
+            q.done = [&br, s](srv::GenResult r) { br.seqs[s] = std::move(r); };
+            sched.submit(std::move(q));
+        }
+        br.prefill_end_bytes = ec_open.bytes_streamed;
+        bool prefill_recorded = false;
+        while (sched.step()) {
+            const auto st = sched.stats();
+            if (!prefill_recorded && st.prefilling == 0 && st.waiting == 0) {
+                br.prefill_end_bytes = eng->counters().bytes_streamed;
+                prefill_recorded = true;
+            }
+            if (bp.on_step) bp.on_step(static_cast<int32_t>(st.steps), st.active);
+        }
+        br.steps = static_cast<uint64_t>(sched.stats().steps);
+    } else {
+        br = srv::BatchGenerator(*eng).run(bp);
+    }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     const auto ec1 = eng->counters();
 
@@ -188,6 +230,9 @@ int cmd_batch(const Args& a) {
     // flag -- and the loud line, so text greps see it like cmd_run's.
     const bool over = eng->live_over_cap();
     if (over) std::printf("  *** CAP BREACH occurred during this run ***\n");
+    // As run does: the cache, the slot pool, the reads -- on stderr, beside the
+    // live progress, so the recorded stdout stays what golden compares.
+    std::fprintf(stderr, "%s\n", eng->streamer_report().c_str());
     std::printf("\n%s\n", eng->accountant_report().c_str());
     eng.reset();
     return (!any_bad && fails == 0 && !over) ? 0 : 1;

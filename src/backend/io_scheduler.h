@@ -200,8 +200,12 @@ public:
     bool read_exact_via(io::FileId f, const Source& s, void* dst, uint64_t bytes);
     // A whole tensor with NO staging and NO copy: allocated at the widened span
     // and read into directly; the tensor then points at base + *out_head.
+    // Issued in chunks of at most 1 GiB by default (a request length is 32 bits).
     void* read_whole(mem::Category cat, const Source& s, uint64_t bytes,
                      uint64_t* out_alloc, uint32_t* out_head);
+    // The largest single request read_whole issues (1 GiB). Settable for a backend
+    // with a smaller transfer limit, and so tests can exercise chunking on small files.
+    void     set_whole_chunk(uint64_t bytes) { whole_chunk_ = bytes; }
 
     // Handles for callers that need independent access to the same files.
     // Load time only (before start_thread): the backend's file table is not
@@ -255,6 +259,7 @@ private:
     std::unique_ptr<io::Backend>           io_;
     std::vector<io::FileId>                shards_;
     uint32_t                               align_ = 4096;
+    uint64_t                               whole_chunk_ = 1ull << 30;   // read_whole request size
 
     // Shared with the I/O thread, all under m_.
     mutable std::mutex                     m_;

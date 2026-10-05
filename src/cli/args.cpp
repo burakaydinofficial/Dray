@@ -1,5 +1,7 @@
 #include "cli/args.h"
 
+#include "config/settings.h"
+
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -8,30 +10,6 @@
 
 namespace dray::cli {
 
-
-// Cap parsing accepts a plain byte count or a K/M/G suffix. GiB vs GB is a real
-// trap: "64 GB of RAM" almost always means 64 GiB. We treat bare G as GiB
-// (what users mean) and print both units everywhere so the ambiguity never bites.
-uint64_t parse_size(const std::string& s, bool* ok) {
-    *ok = false;
-    if (s.empty()) return 0;
-    char* end = nullptr;
-    double v = std::strtod(s.c_str(), &end);
-    if (end == s.c_str() || v < 0) return 0;
-    uint64_t mult = 1;
-    switch (*end) {
-        case 'k': case 'K': mult = 1ull << 10; ++end; break;
-        case 'm': case 'M': mult = 1ull << 20; ++end; break;
-        case 'g': case 'G': mult = 1ull << 30; ++end; break;
-        case 't': case 'T': mult = 1ull << 40; ++end; break;
-        case '\0': break;
-        default: return 0;
-    }
-    if (*end == 'b' || *end == 'B') ++end;
-    if (*end != '\0') return 0;
-    *ok = true;
-    return static_cast<uint64_t>(v * static_cast<double>(mult));
-}
 
 void usage() {
     std::printf(
@@ -45,21 +23,28 @@ void usage() {
         "                    [--ctx N] [--seed N] [--temp] [--stop S] [--status FILE]\n"
         "  dray batch     -m <model.gguf> --batch N [--prompts FILE] [-n N] [--stop S]\n"
         "                    [--rotate SPAN --state-dir DIR]\n"
-        "  dray serve     -m <model.gguf> [--cap 4G] [--ctx N] [--port 8080]\n"
+        "  dray serve     -m <model.gguf> [--cap 4G] [--ctx N] [--port 8080] [--parallel N]\n"
         "                    [--jobs-dir DIR] [--api-key KEY] [--repack DIR]\n"
         "                    OpenAI-compatible API (/v1/chat/completions, SSE);\n"
-        "                    admission serialized, one generation at a time.\n"
+        "                    --parallel (serve.max_parallel, default 1) requests generate\n"
+        "                    together, each with its own --ctx context, inside --cap.\n"
         "                    --jobs-dir enables background jobs with crash-resume;\n"
         "                    --api-key requires Authorization: Bearer KEY on /v1/*.\n"
-        "  diagnostics:      verify | stream | snaptest | repack --out DIR\n\n"
+        "  dray config    -m <model.gguf> [--config-dir DIR] [--threads N] [--prefill-chunk N]\n"
+        "                    every effective setting for this model, and where it came from\n"
+        "  diagnostics:      verify | snaptest | repack --out DIR\n\n"
         "  --cap            total resident byte budget. The mandatory floor and KV\n"
         "                   reservation are subtracted from this to yield the expert\n"
         "                   cache; the cap is never exceeded. Default 4G.\n"
         "  --ctx            context length. Costs KV, which competes with the cache.\n"
         "  --kv             KV cache type: f16 (default), q8, q4 (q4/q8 force flash attention)\n"
         "  --gpu            runtime GPU consent: prefill on the GPU, weights stay in RAM\n"
-        "  --threads N      compute threads (default: 4 decode, cores-9 prefill)\n"
-        "  --prefill-chunk  tokens per prefill pass (default 512 CPU, 2048 GPU)\n"
+        "  --threads N      compute threads, decode and prefill (settings: threads.*)\n"
+        "  --prefill-chunk  tokens per prefill pass (settings: prefill.chunk_cpu/gpu)\n"
+        "  --config-dir DIR user settings directory (system.json, models/<arch>.json);\n"
+        "                   default DRAY_CONFIG_DIR, else the platform config dir\n"
+        "  --vram-cap 2G    HARD limit on VRAM for --gpu (settings: gpu.vram_cap;\n"
+        "                   default: a quarter of the card, half on a small one)\n"
         "  --force-stream   keep the streaming path even when the model fits\n"
         "  --override-kv    key=int|float|bool|str:value, GGUF metadata override\n"
         "  --repack DIR     use the repacked companion made by `repack --out DIR`\n"
@@ -112,8 +97,13 @@ bool parse_args(int argc, char** argv, Args* a) {
         else if (k == "-n" || k == "--n-predict") { if (!next_int(1, 1 << 24, &nv)) return false; a->n_predict = static_cast<int32_t>(nv); }
         else if (k == "--cap") {
             if (!next(&v)) return false;
-            bool ok = false; a->cap = parse_size(v, &ok);
+            bool ok = false; a->cap = config::parse_size(v, &ok);
             if (!ok) { std::fprintf(stderr, "bad --cap value: %s\n", v.c_str()); return false; }
+        }
+        else if (k == "--vram-cap") {
+            if (!next(&v)) return false;
+            bool ok = false; a->vram_cap = config::parse_size(v, &ok);
+            if (!ok || a->vram_cap == 0) { std::fprintf(stderr, "bad --vram-cap value: %s\n", v.c_str()); return false; }
         }
         else if (k == "--ctx") { if (!next_int(1, 1 << 24, &nv)) return false; a->n_ctx = static_cast<uint32_t>(nv); }
         else if (k == "--seed") { if (!next_int(0, 4294967295LL, &nv)) return false; a->seed = static_cast<uint32_t>(nv); }
@@ -128,6 +118,8 @@ bool parse_args(int argc, char** argv, Args* a) {
         }
         else if (k == "--out") { if (!next(&v)) return false; a->out_dir = v; }
         else if (k == "--repack") { if (!next(&v)) return false; a->repack_dir = v; }
+        else if (k == "--config-dir") { if (!next(&v)) return false; a->config_dir = v; }
+        else if (k == "--parallel") { if (!next_int(1, 1024, &nv)) return false; a->parallel = static_cast<int32_t>(nv); }
         else if (k == "--jobs-dir") { if (!next(&v)) return false; a->jobs_dir = v; }
         else if (k == "--api-key") { if (!next(&v)) return false; a->api_key = v; }
         else if (k == "--batch") { if (!next(&v)) return false; a->n_batch_seq = static_cast<uint32_t>(std::strtoul(v.c_str(), nullptr, 10)); }

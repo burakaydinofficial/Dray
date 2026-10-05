@@ -39,7 +39,7 @@
 // WHERE THINGS LIVE. This header is the whole public surface. Behind it,
 // streamer_impl.h composes the parts: accounted_alloc, poison_buffers,
 // io_scheduler, tensor_registry, residency_cache, expert_compactor,
-// expert_slots + routing_skew, uncond_ring, hit_rates, repacker, private_ids;
+// expert_slots + routing_skew, uncond_ring, hit_rates, private_ids;
 // stream_budget and stream_flags are the setup they are built from, and
 // stream_buffer_type.cpp is the ggml callback glue.
 
@@ -76,6 +76,13 @@ struct Config {
     // Slab sizing is derived from the plan, not guessed: enough slots to hold the
     // widest single node's working set, plus whatever the cap allows for reuse.
     uint64_t min_slots_per_layer = 0;
+    // POLICY: the share of the bytes a pass reads from disk that the frequency
+    // cache may copy into slots in that pass. Admission is an investment
+    // against future reads, paid in copy work on the decode path; this bounds
+    // it relative to the pass's own I/O, whatever the model, slot size or cap,
+    // and -- unlike a time budget -- keeps bytes read deterministic. Built-in
+    // default; the system config overrides it (and a model config may).
+    double   admit_byte_fraction = 0.10;
 };
 
 // Owns the slab, the shard handles and the tensor->Source map. One per model.
@@ -98,6 +105,17 @@ public:
 
     // Releases the refcounts taken by materialise() for this node.
     void release(struct ggml_tensor* node);
+
+    // A weight is about to be copied to another backend (a GPU split's input):
+    // ggml reads its bytes directly from host memory BEFORE any eval callback
+    // runs, so they must be present now -- until copy_end(). `experts` (an
+    // expert-fused weight whose copy reads only those): just them; otherwise
+    // the whole tensor. Not ours: nothing. False: it could not be brought in
+    // (counted as a failure).
+    bool copy_begin(struct ggml_tensor* t, const int32_t* experts, int64_t n_experts);
+    void copy_end(struct ggml_tensor* t);
+    static void copy_cb(struct ggml_tensor* t, const int32_t* experts, int64_t n_experts,
+                        bool before, void* streamer);
 
     uint64_t bytes_streamed() const { return bytes_streamed_; }
     uint64_t nodes_materialised() const { return nodes_; }
@@ -145,9 +163,6 @@ public:
     struct SelfCheck {
         size_t checked = 0;
         size_t mismatched = 0;
-        // Repacked tensors cannot be compared to the file (their bytes were
-        // rewritten for the optimised kernels). Counted, never hidden.
-        size_t skipped_repacked = 0;
         bool ok() const { return checked > 0 && mismatched == 0; }
     };
     SelfCheck self_check(size_t max_tensors = 32);
@@ -188,6 +203,16 @@ public:
     // knew at load).
     uint64_t churn_reserve_bytes() const;
     uint64_t batch_region_bytes() const;
+    // The expert slot pool's size: memory the streamer can do without. Other
+    // optional caches (parked conversations) may compete for it -- never more.
+    uint64_t spare_cache_bytes() const;
+    // --gpu: the bytes of pinned landing memory GPU copies want -- the largest routed-
+    // expert tensor, with alignment room -- or 0 when every routed tensor can stay
+    // cached whole (copies then come from the cache). set_gpu_copy_pool allocates it
+    // from the GPU device's host buffer type; false if that is impossible. The CALLER
+    // charges it to the cap.
+    uint64_t gpu_copy_pool_wanted() const;
+    bool set_gpu_copy_pool(uint64_t bytes);
     // True when this node has a disk-backed source and the engine must act on
     // it. Answering false lets ggml batch consecutive nodes into ONE compute
     // call instead of one per node with a barrier between (see the definition).

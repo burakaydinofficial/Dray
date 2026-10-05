@@ -65,6 +65,12 @@ dray_add_test(two_shard)
 dray_add_test(residency)
 # ResidencyCache::take_region: region reuse must behave exactly as an eviction.
 dray_add_test(region_reuse)
+# ExpertSlots: the admission byte budget (the storm guard).
+dray_add_test(expert_slots)
+# Settings layers, strict parsing, system-only hardware fields.
+dray_add_test(settings)
+# Scheduler: continuous batching over a scripted stepper.
+dray_add_test(scheduler)
 dray_add_test(storage)
 # Differential check on expert compaction: the streamer's central trick, and the
 # one place where being wrong yields fluent text from the wrong weights rather
@@ -106,3 +112,18 @@ else()
         "tests: skipping snapshot_cache -- src/cache/snapshot_cache.h does not exist yet. "
         "tests/test_snapshot_cache.cpp is written and waiting for it.")
 endif()
+
+# ChatFormat: the model's own chat template (tools, reasoning) and the output
+# parser, through llama.cpp's chat library, on real templates from its repo.
+dray_add_test(chat_format)
+target_link_libraries(test_chat_format PRIVATE dray_chatfmt)
+target_include_directories(test_chat_format PRIVATE ${CMAKE_SOURCE_DIR}/third_party)   # json.hpp
+target_compile_definitions(test_chat_format PRIVATE
+    DRAY_LLAMA_TEMPLATES="${CMAKE_SOURCE_DIR}/third_party/llama.cpp/models/templates")
+
+# chat_request / chat_response: the /v1/chat/completions contract, pure.
+dray_add_test(chat_api)
+target_link_libraries(test_chat_api PRIVATE dray_server dray_chatfmt)
+target_include_directories(test_chat_api PRIVATE ${CMAKE_SOURCE_DIR}/third_party)   # json.hpp
+target_compile_definitions(test_chat_api PRIVATE
+    DRAY_LLAMA_TEMPLATES="${CMAKE_SOURCE_DIR}/third_party/llama.cpp/models/templates")

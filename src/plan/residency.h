@@ -31,12 +31,21 @@ enum class TensorClass : uint8_t {
                      // round trip per layer per token that can never be overlapped.
     NormOrBias,      // tiny and scattered; per-request overhead dominates
     RoutedExpert,    // ffn_{gate,up,down}_exps: the streamed population
-    UnconditionalBulk,  // attention/mixer projections, shared experts, embd, output
+    UnconditionalBulk,  // attention/mixer projections, shared experts, output
+    RowSliced,       // a table only ever GATHERED by rows (the token embedding when
+                     // output.weight is separate; per-layer / engram embedding
+                     // tables): a few rows per token, never read whole
 };
 
 struct TensorInfo {
     std::string name;
     TensorClass cls = TensorClass::UnconditionalBulk;
+    // A token-embedding table: its lookups are GET_ROWS, which the streamer
+    // serves by reading only the requested rows. True whatever the class -- a
+    // TIED embedding (no output.weight) is also the output projection, so it is
+    // read whole every token and classed UnconditionalBulk, but its lookups
+    // still row-slice.
+    bool        row_gathered = false;
     int32_t     layer = -1;      // -1 for non-layer tensors
     // Offset is absolute WITHIN ITS SHARD, so it is meaningless without `shard`.
     // Every target ships 4-14 shards and a layer's tensors can sit in a different
@@ -96,6 +105,7 @@ struct Plan {
     uint64_t min_cap = 0;
 
     uint64_t unconditional_bytes = 0;   // read every token when not cached
+    uint64_t row_sliced_bytes = 0;      // gathered a few rows at a time, never whole
     uint64_t routed_bytes = 0;          // whole routed population on disk
     uint64_t cold_bytes_per_token = 0;  // k * n_moe_layers * mean slot bytes
 

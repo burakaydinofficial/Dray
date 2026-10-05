@@ -105,8 +105,8 @@ constexpr ggml_type kKvType = GGML_TYPE_F16;
 // Recurrent state is F32 in llama_memory_recurrent regardless of the weight quant.
 constexpr ggml_type kRecurrentStateType = GGML_TYPE_F32;
 
-// One sequence in flight. Admission is serialized by default (Invariant 7), so the
-// recurrent-state reservation is for one sequence, not a batch.
+// The single-stream default. batch and serve fund n_seq sequences explicitly (the
+// plan's n_seq); this is the reservation when nothing asks for more.
 constexpr uint64_t kResidentSequences = 1;
 
 // Upper bound for the max-n_ctx bisection. Above this the prefill activation term
@@ -545,6 +545,7 @@ uint64_t min_working_set(const Plan& p) {
     uint64_t widest_whole = 0;
     for (const TensorInfo& t : p.tensors) {
         if (t.cls == TensorClass::RoutedExpert) continue;   // read per expert slot
+        if (t.cls == TensorClass::RowSliced) continue;      // read per row
         widest_whole = std::max(widest_whole, t.bytes);
     }
 
@@ -620,8 +621,8 @@ std::string Plan::report() const {
 
     // -- classification totals, recomputed from the tensor list so the report can
     //    never disagree with the plan it describes.
-    uint64_t cls_bytes[4] = {0, 0, 0, 0};
-    uint64_t cls_count[4] = {0, 0, 0, 0};
+    uint64_t cls_bytes[5] = {0, 0, 0, 0, 0};
+    uint64_t cls_count[5] = {0, 0, 0, 0, 0};
     uint64_t all_bytes = 0;
     for (const TensorInfo& t : tensors) {
         const size_t i = static_cast<size_t>(t.cls);
@@ -646,9 +647,11 @@ std::string Plan::report() const {
        << "\n\n";
 
     os << "classification  (bytes from the GGUF tensor table, never from an assumed bpw)\n";
-    static const char* const kClassName[4] = {"router gates", "norms and biases",
-                                              "routed experts", "unconditional bulk"};
-    for (size_t i = 0; i < 4; ++i) {
+    static const char* const kClassName[5] = {"router gates", "norms and biases",
+                                              "routed experts", "unconditional bulk",
+                                              "row-sliced tables"};
+    for (size_t i = 0; i < 5; ++i) {
+        if (i == 4 && cls_count[i] == 0) continue;   // a model that ties token_embd has none
         os << "  " << rpad(kClassName[i], 26) << lpad(bytes_exact(cls_bytes[i]), 20)
            << "   " << lpad(group_digits(cls_count[i]), 6) << " tensors"
            << "   " << pct_of(cls_bytes[i], all_bytes) << "\n";
@@ -860,6 +863,7 @@ Plan build_plan(const std::string& gguf_path, uint64_t cap_bytes, uint32_t n_ctx
                 }
             }
             t.cls = classify(t.name);
+            t.row_gathered = contains(t.name, "token_embd");
             t.layer = layer_of(t.name);
             // Absolute WITHIN THIS SHARD, so it travels with the shard index.
             // Using it against another shard's handle reads plausible garbage
@@ -1062,6 +1066,20 @@ Plan build_plan(const std::string& gguf_path, uint64_t cap_bytes, uint32_t n_ctx
     kv_u64(meta, a + "expert_used_count", &n_expert_used);
 
     // -- class totals and per-layer routed sums -----------------------------
+    // Embedding tables are only gathered by rows -- unless the model TIES its
+    // output projection to token_embd (no output.weight), in which case that one
+    // table is also a whole matmul every token and stays unconditional bulk.
+    // Pricing a 27 GB engram table as a whole read refused Qwen3.8-Flash-Next
+    // below 27 GiB and projected 33 GB/token it never reads.
+    bool has_output = false;
+    for (const TensorInfo& t : plan.tensors) has_output = has_output || t.name == "output.weight";
+    for (TensorInfo& t : plan.tensors) {
+        if (t.row_gathered && t.cls == TensorClass::UnconditionalBulk &&
+            (has_output || t.name != "token_embd.weight")) {
+            t.cls = TensorClass::RowSliced;
+        }
+    }
+
     std::vector<uint64_t> routed_by_layer(n_layer_slots, 0);
     bool any_routed = false;
     for (const TensorInfo& t : plan.tensors) {
@@ -1081,6 +1099,9 @@ Plan build_plan(const std::string& gguf_path, uint64_t cap_bytes, uint32_t n_ctx
                 break;
             case TensorClass::UnconditionalBulk:
                 plan.unconditional_bytes += t.bytes;
+                break;
+            case TensorClass::RowSliced:
+                plan.row_sliced_bytes += t.bytes;
                 break;
         }
     }

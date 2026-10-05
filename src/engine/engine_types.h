@@ -44,6 +44,11 @@ struct EngineConfig {
     // correctness gates must be able to pin the streaming path or they
     // silently stop testing this engine at all.
     bool force_stream = false;
+    // --config-dir: the user settings directory (see config/paths.h). Empty =
+    // DRAY_CONFIG_DIR, else the platform default.
+    std::string config_dir;
+    // --vram-cap: the hard VRAM limit for --gpu; 0 = gpu.vram_cap from the settings.
+    uint64_t vram_cap = 0;
     // --resident: accepted for compatibility and otherwise unused. Resident
     // mode (llama allocates the model when it fits the cache budget) is the
     // DEFAULT since 2026-08-22, gated by scripts/residenttest.ps1; only
@@ -139,9 +144,10 @@ struct EngineCounters {
 // N sequences decoded in LOCKSTEP through the same streamer: the unconditional
 // stream is read once per step for all of them, routed experts once per step
 // for the UNION of selections -- the entire economic case for batching on this
-// engine. The server stays serialized (Invariant 7); this API is for the
-// `dray batch` subcommand. Sequences finish independently (EOG/stop/budget)
-// and the batch shrinks; per-sequence seeds are seed+s, disclosed in results.
+// engine. The server runs the same economics through engine::Scheduler (serve
+// --parallel); this API is for the `dray batch` subcommand. Sequences finish
+// independently (EOG/stop/budget) and the batch shrinks; per-sequence seeds are
+// seed+s, disclosed in results.
 struct BatchParams {
     std::vector<std::string> prompts;   // one per sequence; size = batch size
     int32_t     max_tokens  = 512;

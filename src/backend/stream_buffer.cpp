@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include "backend/stream_budget.h"
 #include "backend/stream_buffer_type.h"
@@ -96,7 +97,6 @@ ggml_status Streamer::Impl::on_init_tensor(ggml_tensor* t) {
         t->data = m;
         Resident r; r.mem = m; r.bytes = ggml_nbytes(t); r.pinned = true;
         r.cat = fcat;
-        r.repacked = repacker.maybe_repack(t);
         cache.add_permanent(t, r);
         return GGML_STATUS_SUCCESS;
     }
@@ -150,6 +150,11 @@ Streamer::Streamer(mem::Accountant& acct, const plan::Plan& p, Config cfg)
     // norms are pinned; everything else streams, including attention and shared
     // experts -- at a 4 GB cap those do not fit either.
     for (const plan::TensorInfo& t : p.tensors) {
+        if (t.cls == plan::TensorClass::RoutedExpert) {
+            im.routed_bytes += t.bytes;
+            uint64_t& kmax = im.routed_max[ExpertCompactor::copy_kind_of(t.name.c_str())];
+            kmax = std::max<uint64_t>(kmax, t.bytes);
+        }
         Source s;
         s.shard  = t.shard;
         s.offset = t.offset;
@@ -158,10 +163,9 @@ Streamer::Streamer(mem::Accountant& acct, const plan::Plan& p, Config cfg)
                     t.cls == plan::TensorClass::NormOrBias);
         s.is_router_gate = (t.cls == plan::TensorClass::RouterGate);
         s.disk_stride = t.disk_stride;
-        // Routed experts are compacted; the token embedding is row-sliced. Neither
-        // ever needs its full size resident, so neither bounds the minimum cap.
-        s.sliceable = (t.cls == plan::TensorClass::RoutedExpert) ||
-                      (t.name.find("token_embd") != std::string::npos);
+        // Routed experts are compacted; embedding tables are row-sliced (the
+        // planner marks them). Their lookups never need the full size resident.
+        s.sliceable = (t.cls == plan::TensorClass::RoutedExpert) || t.row_gathered;
         s.routed = (t.cls == plan::TensorClass::RoutedExpert);   // I2: class matters per-lever
         im.tensors.add_source(t.name, s);
     }
@@ -188,6 +192,8 @@ Streamer::Streamer(mem::Accountant& acct, const plan::Plan& p, Config cfg)
     // eslot pool is sized against the ring actually allocated.
     im.cache.set_churn_reserve(budget.churn_reserve);
     im.batch_region_bound = budget.batch_region_bound;
+    im.compactor.set_funded_union(budget.funded_union);
+    im.cache.set_spill(&im.slots);   // the pool gives memory back under pressure
     if (budget.ring_target) im.ring.allocate(budget.ring_target, im.io.align());
     im.slots.set_pool(budget.eslot_pool(im.ring.bytes()));
 
@@ -207,15 +213,16 @@ Streamer::Streamer(mem::Accountant& acct, const plan::Plan& p, Config cfg)
 
     // The ggml buffer type llama.cpp will allocate weights from.
     init_stream_buffer_type(im);
-    // A: opt this buffer type into the optimised matmul kernels when repacking
-    // is enabled (see repacker.h: measured negative, off by default).
-    im.repacker.accept(&im.buft);
     im.buft.context = &im;
 }
 
 Streamer::~Streamer() {
     if (!impl_) return;
     Impl& im = *impl_;
+    if (im.pinned_buf) {
+        im.compactor.settle_copy_slots();   // read-aheads still DMA into it
+        ggml_backend_buffer_free(static_cast<ggml_backend_buffer_t>(im.pinned_buf));
+    }
     // Teardown order is load-bearing only where DMA is involved: pending regions
     // and ring segments settle every outstanding read before their memory is
     // released, and leak it -- loudly -- when the backend died with reads still
@@ -245,7 +252,7 @@ static void produce_timed(Streamer::Impl& im) {
         std::chrono::steady_clock::now() - t0).count();
 }
 
-bool Streamer::Impl::bring_in(ggml_tensor* t, uint64_t* streamed) {
+bool Streamer::Impl::bring_in(ggml_tensor* t, uint64_t* streamed, bool transient) {
     const auto t0 = std::chrono::steady_clock::now();
     auto took = [&](Source_ from) {
         ns_from[from] += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -308,10 +315,9 @@ bool Streamer::Impl::bring_in(ggml_tensor* t, uint64_t* streamed) {
     nr.refs = 0;
     // Whole-tensor materialisation is an unconditional weight: attention, shared
     // experts, embedding, lm_head. Read every token, so worth ~51x a routed byte.
-    nr.prio = Prio::Unconditional;
-    nr.pinned = cache.claim_static(alloc_bytes);
+    nr.prio = transient ? Prio::RoutedExpert : Prio::Unconditional;
+    nr.pinned = !transient && cache.claim_static(alloc_bytes);
     t->data = static_cast<uint8_t*>(m) + head;
-    nr.repacked = repacker.maybe_repack(t);
     cache.add(t, nr);
     *streamed += bytes;
     // Pass-4b: a whole-tensor read of a ROUTED (expert-fused, ne[2]>1) tensor
@@ -335,6 +341,11 @@ bool Streamer::Impl::bring_in(ggml_tensor* t, uint64_t* streamed) {
 bool Streamer::needs(ggml_tensor* node) {
     if (!node || !impl_) return false;
     Impl& im = *impl_;
+    // A node computed on another device (a GPU split, --gpu prefill): its
+    // weights arrived as device copies through copy_begin, and nothing of ours
+    // is read there. Claiming it would cut the split into single-node computes,
+    // each with a full synchronize and none of the backend's kernel fusion.
+    if (node->buffer && !ggml_backend_buffer_is_host(node->buffer)) return false;
     // Claiming every node costs a thread-pool barrier each. DRAY_FAST_NODES=1
     // opts into the predicate below, which is now CORRECT on all five
     // architectures in archgate -- the earlier divergence was a real bug, found
@@ -391,9 +402,11 @@ bool Streamer::materialise(ggml_tensor* node) {
     struct TimeIt {
         Streamer::Impl* im; const ggml_tensor* node; std::chrono::steady_clock::time_point t0;
         ~TimeIt() {
+            const auto t_end = std::chrono::steady_clock::now();
             const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - t0).count();
+                t_end - t0).count();
             im->ns_materialise += ns;
+            im->t_mat_end = t_end;
             ++im->n_materialise;
             const int c = wait_class();
             im->ns_wait[c] += ns;
@@ -448,8 +461,13 @@ bool Streamer::materialise(ggml_tensor* node) {
     // different node types, and a bisect that cannot tell them apart wastes a cycle.
     const bool no_rowslice = im.flags.no_rowslice;
 
-    // Forward-pass boundary: the embedding lookup is the first op of every pass.
-    if (node->op == GGML_OP_GET_ROWS && node->src[0]) {
+    // Forward-pass boundary: the token-embedding lookup is the first op of every
+    // pass. THE token embedding, by its GGUF name -- not any row-sliced table: a
+    // model with a second one (an engram / per-layer embedding table, gathered
+    // once per pass too) would otherwise count two passes per token, and the ring
+    // would build its stream list in the middle of the first.
+    if (node->op == GGML_OP_GET_ROWS && node->src[0] &&
+        std::strcmp(node->src[0]->name, "token_embd.weight") == 0) {
         const Source* bs = im.tensors.source_of(node->src[0]);
         if (bs && bs->sliceable) {
             ++im.pass_count;
@@ -627,6 +645,10 @@ void Streamer::release(ggml_tensor* node) {
     // replaces. But a release callback is CPU time the drive can use.
     if (!impl_) return;
     Impl& im = *impl_;
+    if (im.t_mat_end.time_since_epoch().count() != 0) {
+        im.ns_node_compute += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            t_enter_rel - im.t_mat_end).count();
+    }
 
     // PHASE C: if this node IS a router's ids tensor, its data was computed an
     // instant ago -- the earliest moment the layer's expert addresses exist.
@@ -668,7 +690,6 @@ Streamer::SelfCheck Streamer::self_check(size_t max_tensors) {
         if (out.checked >= max_tensors) break;
         const Resident& r = kv.second;
         if (!r.pinned || !r.mem || r.bytes == 0) continue;
-        if (r.repacked) { ++out.skipped_repacked; continue; }   // no longer file-shaped
         const Source* b = im.tensors.source_of(kv.first);
         if (!b) continue;          // no disk source to compare to
         const Source s = *b;
@@ -817,6 +838,12 @@ std::string Streamer::report() const {
       << im.compactor.early_unlocks() << " early-unlocked, " << im.ring.promotions() << " promoted, "
       << im.slots.hits() << " eslot hits (" << (im.slots.bytes() / 1e9) << " of "
       << (im.slots.pool() / 1e9) << " GB pool)";
+    if (im.copies) {
+        o << ", " << im.copies << " GPU copies (weights made present " << im.ns_copy_ready / 1000000
+          << "ms, copy until done " << im.ns_copy_done / 1000000 << "ms; read ahead "
+          << im.compactor.copy_prefetch_hits() << " used, " << im.compactor.copy_prefetch_misses()
+          << " wasted)";
+    }
 
     // I/O FORENSICS, off unless asked for (DRAY_IO_STATS=1). These counters
     // located the bandwidth defect on 2026-08-24 and are worth keeping, but they
@@ -824,7 +851,8 @@ std::string Streamer::report() const {
     // it was before that investigation.
     if (im.flags.io_stats) {
         o << ", cb " << (im.ns_materialise / 1000000)
-          << "ms mat/" << (im.ns_release / 1000000) << "ms rel over " << im.n_materialise
+          << "ms mat/" << (im.ns_release / 1000000) << "ms rel/" << (im.ns_node_compute / 1000000)
+          << "ms node compute over " << im.n_materialise
           << " calls (mat by wait: routed " << (im.ns_wait[Impl::kWaitRouted] / 1000000)
           << "ms/" << im.n_wait[Impl::kWaitRouted] << ", rows "
           << (im.ns_wait[Impl::kWaitRows] / 1000000) << "ms/" << im.n_wait[Impl::kWaitRows]
@@ -840,15 +868,166 @@ std::string Streamer::report() const {
         im.compactor.append_timing(o);
         o << ", evictions " << im.cache.evictions() << " (" << im.cache.evicted_bytes() / 1000000000.0
           << " GB, " << im.cache.ns_evict_free() / 1000000 << "ms freeing), "
-          << im.cache.regions_reused() << " regions reused in place";
+          << im.cache.regions_reused() << " regions reused in place, "
+          << im.cache.regions_recycled() << " recycled by their own tensor";
+        im.slots.append(o);
     }
-    im.repacker.append(o);
     im.hits.append(o);
     im.skew.append(o);
     if (im.failures) {
         o << "  [" << im.failures << " MATERIALISE FAILURES -- output is not trustworthy]";
     }
     return o.str();
+}
+
+}  // namespace dray::backend
+
+namespace dray::backend {
+
+uint64_t Streamer::spare_cache_bytes() const {
+    return impl_ ? impl_->slots.pool() : 0;
+}
+
+}  // namespace dray::backend
+
+namespace dray::backend {
+
+namespace {
+
+// Allocates the pinned landing pool: host memory from the GPU device's own host buffer
+// type, which its copies DMA from directly. False leaves it as it was.
+bool alloc_pinned(Streamer::Impl& im, uint64_t bytes) {
+    ggml_backend_dev_t gpu = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count() && !gpu; ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) gpu = d;
+    }
+    ggml_backend_buffer_type_t buft = gpu ? ggml_backend_dev_host_buffer_type(gpu) : nullptr;
+    if (!buft) return false;
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, bytes);
+    if (!buf) return false;
+    if (im.pinned_buf) ggml_backend_buffer_free(static_cast<ggml_backend_buffer_t>(im.pinned_buf));
+    im.pinned_buf = buf;
+    im.pinned = static_cast<uint8_t*>(ggml_backend_buffer_get_base(buf));
+    im.pinned_bytes = bytes;
+    return true;
+}
+
+}  // namespace
+
+namespace {
+
+constexpr uint64_t kSlotSlack = 2 * 65536;   // room to align a direct-I/O landing
+
+}  // namespace
+
+// One slot per expert kind, each the size of that kind's largest tensor: one is
+// copied while the layer's other two are read ahead (prefetch_copy_siblings).
+uint64_t Streamer::gpu_copy_pool_wanted() const {
+    if (!impl_ || impl_->routed_bytes == 0) return 0;
+    if (impl_->routed_bytes <= impl_->mem.cache_budget()) return 0;   // experts stay cached whole
+    uint64_t sum = 0;
+    for (uint64_t m : impl_->routed_max) sum += m ? m + kSlotSlack : 0;
+    return sum;
+}
+
+bool Streamer::set_gpu_copy_pool(uint64_t bytes) {
+    if (!impl_ || !bytes || !alloc_pinned(*impl_, bytes)) return false;
+    Impl& im = *impl_;
+    uint8_t* base[ExpertCompactor::kCopyKinds] = {};
+    uint64_t size[ExpertCompactor::kCopyKinds] = {};
+    uint64_t off = 0;
+    for (int k = 0; k < ExpertCompactor::kCopyKinds; ++k) {
+        if (!im.routed_max[k]) continue;
+        size[k] = im.routed_max[k] + kSlotSlack;
+        if (off + size[k] > im.pinned_bytes) { size[k] = 0; continue; }
+        base[k] = im.pinned + off;
+        off += size[k];
+    }
+    im.compactor.set_copy_slots(base, size);
+    return true;
+}
+
+bool Streamer::copy_begin(ggml_tensor* t, const int32_t* experts, int64_t n_experts) {
+    if (!impl_ || !t) return true;
+    Impl& im = *impl_;
+    // A view of a weight copies the weight's bytes.
+    ggml_tensor* w = t;
+    while (w->view_src) w = w->view_src;
+    if (!im.tensors.source_of(w)) return true;   // not ours
+    if (im.flags.io_thread && !im.io.threaded()) im.io.start_thread();
+    im.cache.protect_none();
+    im.cache.protect(w);
+
+    // An expert-fused weight whose copy reads only the routed experts: read
+    // exactly those into a full-size landing region, never cached -- unless
+    // EVERY routed tensor fits the cache budget, in which case whole copies
+    // stay and later chunks and decode reuse them (testbed: landing regions
+    // read 26.0 GB where whole-and-cached read 9.0). Asking only whether THIS
+    // tensor fits the free room was wrong: Flash Next's 72 GB of experts all
+    // "fit" a mostly empty 36 GB cache one at a time, came in whole, and
+    // cycled out before reuse (447.7 GB). Already resident whole: served below.
+    const Resident* r = im.cache.find(w);
+    const bool whole_in_ram = r && r->mem && r->uniq.empty();
+    const bool experts_stay = im.routed_bytes <= im.mem.cache_budget();
+    if (experts && n_experts > 0 && w->ne[2] > 1 && !whole_in_ram && !experts_stay) {
+        Impl::CopyLanding& l = im.landing;
+        l.w = w; l.t = t; l.w_data = w->data; l.t_data = t->data;
+        uint8_t* data = im.compactor.read_experts_for_copy(w, experts, n_experts, &l.mem, &l.bytes,
+                                                           &bytes_streamed_);
+        if (data) {
+            // The layer's other expert tensors come next with the same routing: start
+            // reading them now, under this copy and the GPU work between.
+            im.compactor.prefetch_copy_siblings(w, experts, n_experts, &bytes_streamed_);
+            w->data = data;
+            if (t != w) t->data = data + t->view_offs;
+            return true;
+        }
+        l = Impl::CopyLanding{};   // no room or a read failed: the whole tensor below
+    }
+
+    // Whole: the copy may take any expert, or this is not an expert tensor.
+    // An expert-fused tensor (ne[2] > 1) is routed: only this copy needs it
+    // whole, so it must not take a static pin the next layer's copy needs.
+    if (!im.bring_in(w, &bytes_streamed_, /*transient=*/w->ne[2] > 1)) {
+        ++im.failures;
+        return false;
+    }
+    if (t != w) t->data = static_cast<uint8_t*>(w->data) + t->view_offs;
+    return true;
+}
+
+void Streamer::copy_end(ggml_tensor*) {
+    if (!impl_) return;
+    Impl& im = *impl_;
+    Impl::CopyLanding& l = im.landing;
+    if (l.mem) {
+        if (l.bytes) im.mem.free(mem::Category::ExpertCache, l.mem, l.bytes);   // 0: the pinned pool
+        l.w->data = l.w_data;
+        if (l.t != l.w) l.t->data = l.t_data;
+        l = Impl::CopyLanding{};
+    }
+    im.cache.protect_none();   // copied: evictable again
+}
+
+void Streamer::copy_cb(ggml_tensor* t, const int32_t* experts, int64_t n_experts, bool before, void* p) {
+    auto* s = static_cast<Streamer*>(p);
+    using clock = std::chrono::steady_clock;
+    auto ns = [](clock::duration d) {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+    };
+    if (before) {
+        const auto t0 = clock::now();
+        s->copy_begin(t, experts, n_experts);
+        if (s->impl_) {
+            s->impl_->copy_t1 = clock::now();
+            s->impl_->ns_copy_ready += ns(s->impl_->copy_t1 - t0);
+            ++s->impl_->copies;
+        }
+    } else {
+        if (s->impl_) s->impl_->ns_copy_done += ns(clock::now() - s->impl_->copy_t1);
+        s->copy_end(t);
+    }
 }
 
 }  // namespace dray::backend

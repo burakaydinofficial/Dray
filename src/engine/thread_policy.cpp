@@ -2,18 +2,20 @@
 
 namespace dray::engine {
 
-ThreadChoice choose_threads(int requested, int hardware) {
+ThreadChoice choose_threads(int decode, int prefill, int reserved, int hardware) {
     ThreadChoice c;
-    c.ceiling = hardware > kOwnThreads ? hardware - kOwnThreads : 1;
-    // The default is the MEASURED optimum, not the core count.
-    c.requested = requested > 0 ? requested : 4;
-    int want = c.requested;
-    if (want > c.ceiling) {
+    c.ceiling = hardware > reserved ? hardware - reserved : 1;
+    c.requested = decode;
+    c.decode = decode;
+    if (c.decode > c.ceiling) {
         c.clamped = true;
-        want = c.ceiling;
+        c.decode = c.ceiling;
     }
-    c.decode = want;
-    c.prefill = requested > 0 ? want : c.ceiling;
+    c.prefill = prefill > 0 ? prefill : c.ceiling;
+    if (c.prefill > c.ceiling) {
+        c.clamped = true;
+        c.prefill = c.ceiling;
+    }
     return c;
 }
 

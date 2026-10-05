@@ -88,10 +88,6 @@ void UncondRing::produce() {
                     nr.mem = mem; nr.bytes = nb; nr.pinned = false;
                     nr.prio = Prio::Unconditional;
                     nr.cat = mem::Category::ExpertCache;
-                    // Promoted bytes come from the ring, which holds the file
-                    // layout. Stale repack traits here would tell the kernels to
-                    // read it as interleaved.
-                    fr.t->extra = nullptr;
                     p_.cache.add(fr.t, nr);
                     ++promotions_;
                 }
@@ -207,11 +203,6 @@ bool UncondRing::consume(ggml_tensor* t, uint64_t* streamed) {
         sg.consumed = true;
         if (!settled_ok) sg.reads_ok = false;   // retention must not promote this
         if (!ok) return false;
-        // Raw file bytes, NOT the interleaved layout a repack may have left
-        // traits for. extra is set once at init_tensor and was never cleared, so
-        // the repacked-matmul kernel could dispatch over non-interleaved data
-        // (2026-08-24 audit). Clearing it here is free when repack is off.
-        t->extra = nullptr;
         t->data = arena_ + sg.pos + sg.head;
         *streamed += ggml_nbytes(t);
         p_.hits.add_uncond(ggml_nbytes(t), ggml_nbytes(t));

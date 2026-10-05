@@ -1,11 +1,14 @@
 #include "backend/expert_compactor.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace dray::backend {
+
 
 namespace {
 
@@ -43,7 +46,6 @@ bool ExpertCompactor::compact_rows(ggml_tensor* node, ggml_tensor* w, ggml_tenso
 
     if (const Resident* ex = p_.cache.find(w)) {
         if (ex->uniq == uniq) {
-            w->extra = nullptr;   // compacted slab is not the repacked layout
             w->data = ex->mem;
             p_.ids.install(node, ids, remapped, 1);
             return true;
@@ -75,7 +77,6 @@ bool ExpertCompactor::compact_rows(ggml_tensor* node, ggml_tensor* w, ggml_tenso
     nr.prio = Prio::RoutedExpert;   // valid only for this token's ids, like a compact
     nr.uniq = uniq;
     p_.cache.add(w, nr);
-    w->extra = nullptr;   // freshly compacted bytes; drop any stale repack traits
     w->data = mem;
     p_.ids.install(node, ids, remapped, 1);
     return true;
@@ -84,13 +85,31 @@ bool ExpertCompactor::compact_rows(ggml_tensor* node, ggml_tensor* w, ggml_tenso
 // ---------------------------------------------------------------------------
 // Phase A / Phase C: sibling regions, submitted unwaited
 
-bool ExpertCompactor::alloc_region(const Source& src, uint64_t stride, uint64_t need,
-                                   uint8_t** mem, uint64_t* bytes, uint32_t* head) {
+ExpertCompactor::RegionGeom ExpertCompactor::region_geom(const Source& src, uint64_t stride,
+                                                         uint64_t need) const {
     const uint32_t a = p_.io.align();
     const uint64_t dstride = src.disk_stride ? src.disk_stride : stride;
-    *head = (a && dstride % a == 0) ? static_cast<uint32_t>(src.offset % a) : 0;
-    *bytes = need + (*head ? a : 0);
-    const uint32_t align = *head ? a : kHostAlign;
+    RegionGeom g;
+    g.head = (a && dstride % a == 0) ? static_cast<uint32_t>(src.offset % a) : 0;
+    g.bytes = need + (g.head ? a : 0);
+    g.align = g.head ? a : kHostAlign;
+    return g;
+}
+
+bool ExpertCompactor::alloc_region(const Source& src, uint64_t stride, uint64_t need,
+                                   uint8_t** mem, uint64_t* bytes, uint32_t* head, void* spare) {
+    const RegionGeom g = region_geom(src, stride, need);
+    *head = g.head;
+    *bytes = g.bytes;
+    const uint32_t align = g.align;
+    // The tensor's own previous region, already the right size: the common
+    // decode case (k experts every token), and the one that used to free a
+    // region and commit a fresh one per tensor per token -- 16% of Qwen3.8-
+    // Flash-Next decode at 36 GiB, almost all of it OS zero-fill on first touch.
+    if (spare) {
+        *mem = static_cast<uint8_t*>(spare);
+        return true;
+    }
     // A dead region of the same size first: its pages are committed already, and
     // its ledger charge simply carries over (see ResidencyCache::take_region).
     // ONLY when a fresh allocation would have to evict: then the swap is that
@@ -134,10 +153,18 @@ void ExpertCompactor::submit_sibling_region(ggml_tensor* w, const std::vector<in
     // Strides DIFFER across gate/up/down -- always this tensor's own nb[2].
     const uint64_t stride = static_cast<uint64_t>(w->nb[2]);
     const uint64_t need   = static_cast<uint64_t>(uniq.size()) * stride;
+    // The old region holds the previous token's routing for this tensor, which
+    // this routing replaces; nothing computes from it now (the siblings are
+    // ahead of their nodes). Reclaim it rather than hold both.
+    void* spare = nullptr;
+    if (ex) {
+        const RegionGeom g = region_geom(*src, stride, need);
+        spare = p_.cache.reclaim_own(w, g.bytes, g.align, ResidencyCache::Mismatch::Keep);
+    }
     uint8_t* mem = nullptr;
     uint64_t alloc_bytes = 0;
     uint32_t head = 0;
-    if (!alloc_region(*src, stride, need, &mem, &alloc_bytes, &head)) return;
+    if (!alloc_region(*src, stride, need, &mem, &alloc_bytes, &head, spare)) return;
     uint8_t* data = mem + head;
 
     PendingRegion pr;
@@ -187,7 +214,7 @@ void ExpertCompactor::submit_layer_siblings(ggml_tensor* w, const std::vector<in
 }
 
 void ExpertCompactor::unlock_early(ggml_tensor* node) {
-    if (flags_.no_early || !node || trio_by_ids_.empty() || !is_decode(node)) return;
+    if (flags_.no_early || !node || trio_by_ids_.empty()) return;
     auto it = trio_by_ids_.find(node);
     if (it == trio_by_ids_.end()) return;
     const auto t0 = std::chrono::steady_clock::now();
@@ -200,6 +227,7 @@ void ExpertCompactor::unlock_early(ggml_tensor* node) {
     } timed{&ns_unlock_, t0};
     std::vector<int32_t> uniq, remapped;
     if (!derive_ids_map(node, it->second.n_expert, &uniq, &remapped)) return;
+    if (!fast_path(node, uniq.size())) return;
     for (int s = 0; s < 3; ++s) {
         if (it->second.w[s]) submit_sibling_region(it->second.w[s], uniq);
     }
@@ -247,7 +275,8 @@ bool ExpertCompactor::compact_experts(ggml_tensor* node, ggml_tensor* w, ggml_te
     // ne[1]==1 was only ever a proxy. A batched decode step carries ne[1]==B<=n_seq;
     // prefill chunks carry hundreds. The bound is the admitted width, and at
     // n_seq==1 it reduces to the old test exactly.
-    if (is_decode(ids)) {
+    const bool fast = fast_path(ids, uniq.size());
+    if (fast) {
         ExpertTrio& trio = trio_by_ids_[ids];
         trio.n_expert = n_expert;
         bool known = false;
@@ -261,14 +290,22 @@ bool ExpertCompactor::compact_experts(ggml_tensor* node, ggml_tensor* w, ggml_te
     // Reuse only if the region holds exactly this ordering.
     if (const Resident* ex = p_.cache.find(w)) {
         if (!flags_.no_reuse && ex->uniq == uniq) {
-            w->extra = nullptr;   // compacted slab is not the repacked layout
             w->data = static_cast<uint8_t*>(ex->mem) + ex->head;
             p_.hits.add_routed(static_cast<uint64_t>(uniq.size()) * stride, 0);   // from RAM: read 0
             if (!compact_all) p_.ids.install(node, ids, remapped);
             return true;
         }
-        p_.cache.drop(w);
     }
+    // The previous routing's region is dead from here on: keep its memory for
+    // this routing's region if it fits (alloc_region), else it is freed now.
+    // Held until then, so it is freed on every path that does not consume it.
+    const uint64_t need = static_cast<uint64_t>(uniq.size()) * stride;
+    const RegionGeom geom = region_geom(*src, stride, need);
+    void* spare = p_.cache.reclaim_own(w, geom.bytes, geom.align, ResidencyCache::Mismatch::Drop);
+    auto free_spare = [&] {
+        if (spare) p_.mem.free(mem::Category::ExpertCache, spare, geom.bytes);
+        spare = nullptr;
+    };
 
     // PHASE A: get the whole layer's reads in flight together. Submit the two
     // sibling regions first (unwaited), then handle this tensor -- whose own reads
@@ -283,12 +320,13 @@ bool ExpertCompactor::compact_experts(ggml_tensor* node, ggml_tensor* w, ggml_te
     // caps the trio at ~3 x uniq(n_seq) x stride -- which is precisely what the
     // width-scaled churn reserve funds, so batch fusion is inside the reserve by
     // construction.
-    if (!flags_.no_fuse && is_decode(ids)) submit_layer_siblings(w, uniq);
+    if (!flags_.no_fuse && fast) submit_layer_siblings(w, uniq);
 
     // Adopt a region a sibling's call already submitted for this routing.
     auto pr = pending_.find(w);
     if (pr != pending_.end()) {
         if (pr->second.uniq == uniq) {
+            free_spare();   // the pending region replaces it
             bool dead = false;
             const bool ok = p_.io.settle(pr->second.tags, &dead);
             uint8_t* mem = pr->second.mem;
@@ -310,8 +348,8 @@ bool ExpertCompactor::compact_experts(ggml_tensor* node, ggml_tensor* w, ggml_te
             const uint64_t miss_bytes = static_cast<uint64_t>(miss.size()) * stride;
             *streamed += miss_bytes;
             p_.hits.add_routed(static_cast<uint64_t>(uniq.size()) * stride, miss_bytes);
-            for (size_t k : miss) {
-                p_.slots.admit(w, uniq[k], data + k * stride, stride);
+            if (admits(ids)) {
+                for (size_t k : miss) p_.slots.admit(w, uniq[k], data + k * stride, stride);
             }
             if (!compact_all) p_.ids.install(node, ids, remapped);
             Resident nr; nr.mem = mem; nr.bytes = need_p; nr.head = head_p; nr.pinned = false;
@@ -346,11 +384,12 @@ bool ExpertCompactor::compact_experts(ggml_tensor* node, ggml_tensor* w, ggml_te
         std::fflush(stderr);
     }
 
-    const uint64_t need = static_cast<uint64_t>(uniq.size()) * stride;
     uint8_t* mem = nullptr;
     uint64_t alloc_bytes = 0;
     uint32_t head = 0;
-    if (!alloc_region(*src, stride, need, &mem, &alloc_bytes, &head)) {
+    const bool got = alloc_region(*src, stride, need, &mem, &alloc_bytes, &head, spare);
+    spare = nullptr;   // a non-null spare is always consumed (alloc_region cannot fail with one)
+    if (!got) {
         if (failures_ < 8) {
             std::fprintf(stderr,
                 "[dray] COMPACT FAIL %s: no room  uniq=%zu need=%.2fGB in_use=%.2fGB budget=%.2fGB lru=%zu\n",
@@ -389,20 +428,11 @@ bool ExpertCompactor::compact_experts(ggml_tensor* node, ggml_tensor* w, ggml_te
     const uint64_t miss_bytes = static_cast<uint64_t>(miss_k.size()) * stride;
     *streamed += miss_bytes;
     p_.hits.add_routed(static_cast<uint64_t>(uniq.size()) * stride, miss_bytes);
-    // DECODE ONLY -- the Phase A rule, third appearance: an unreclaimable
-    // allocation made during prefill competes with the static pinning claim that
-    // has not settled yet. GLM at 16 GiB: slots admitted at prefill packed the
-    // budget by layer 52 and the region had no room, nothing evictable. Hits
-    // stay enabled at prefill (they allocate nothing).
-    // SINGLE-STREAM ONLY (measured 2026-08-20, M3 28G B=16 bisect): under
-    // batch the pool pins union experts and, at caps where the unconditional
-    // set fully fits, pool+statics strangle the evictable remainder -- one
-    // materialise failure at the first wide union (need 0.70GB, lru=421,
-    // nothing evictable). NO_ESLOTS cleared it: 2.263 GB/token vs FAIL. The
-    // batch eslot case measured: testbed -22% bytes, K3 nil, M3 fatal -- a
-    // properly EVICTABLE pool is the filed fix; until then batch runs
-    // without eslot admission.
-    if (ids->ne[1] == 1) {
+    // Decode-width steps only (admits(): see there). Hits stay enabled at
+    // prefill -- they allocate nothing. Batch decode admits too since slots
+    // became evictable: the 2026-08-20 M3 28G B=16 failure (need 0.70 GB, lru=421,
+    // nothing evictable) was a committed pool make_room could not ask back.
+    if (admits(ids)) {
         for (size_t k : miss_k) {
             p_.slots.admit(w, uniq[k], data + k * stride, stride);
         }
@@ -437,7 +467,6 @@ bool ExpertCompactor::compact_experts(ggml_tensor* node, ggml_tensor* w, ggml_te
     Resident nr; nr.mem = mem; nr.bytes = alloc_bytes; nr.head = head; nr.pinned = false; nr.uniq = uniq;
     nr.prio = Prio::RoutedExpert;
     p_.cache.add(w, nr);
-    w->extra = nullptr;   // freshly compacted bytes; drop any stale repack traits
     w->data = data;
     return true;
 }
@@ -461,6 +490,187 @@ void ExpertCompactor::release_all() {
         }
     }
     pending_.clear();
+}
+
+}  // namespace dray::backend
+
+namespace dray::backend {
+
+int ExpertCompactor::copy_kind_of(const char* name) {
+    // The ggml MoE naming convention shared by every target model (as in
+    // submit_layer_siblings), not an architecture branch.
+    if (std::strstr(name, "_up_exps") && !std::strstr(name, "_gate_up_exps")) return 1;
+    if (std::strstr(name, "_down_exps")) return 2;
+    return 0;
+}
+
+int ExpertCompactor::copy_kind(const ggml_tensor* w) { return copy_kind_of(w->name); }
+
+void ExpertCompactor::set_copy_slots(uint8_t* const base[kCopyKinds], const uint64_t bytes[kCopyKinds]) {
+    settle_copy_slots();
+    for (int k = 0; k < kCopyKinds; ++k) {
+        copy_slots_[k] = CopySlot{};
+        copy_slots_[k].mem = base[k];
+        copy_slots_[k].bytes = bytes[k];
+    }
+}
+
+bool ExpertCompactor::settle_slot(CopySlot& s) {
+    if (!s.pending) return true;
+    bool dead = false;
+    const bool ok = p_.io.settle(s.tags, &dead);
+    s.tags.clear();
+    s.pending = false;
+    if (dead) {
+        log_region_leak();
+        s.mem = nullptr;   // still a DMA target: never land in it again
+        s.bytes = 0;
+    }
+    return ok;
+}
+
+void ExpertCompactor::settle_copy_slots() {
+    for (CopySlot& s : copy_slots_) settle_slot(s);
+}
+
+namespace {
+
+// Where expert e of a full-size landing region sits in `slot`, placed by `g`
+// (alignment for direct reads), or null if the slot is too small.
+uint8_t* landing_in(uint8_t* slot, uint64_t slot_bytes, uint64_t g_bytes, uint32_t g_align,
+                    uint32_t g_head) {
+    if (!slot || g_bytes + g_align > slot_bytes) return nullptr;
+    const uintptr_t a = g_align ? g_align : 1;
+    uint8_t* base = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(slot) + a - 1) / a * a);
+    return base + g_head;
+}
+
+}  // namespace
+
+uint8_t* ExpertCompactor::read_experts_for_copy(ggml_tensor* w, const int32_t* experts, int64_t n,
+                                                uint8_t** mem, uint64_t* bytes, uint64_t* streamed) {
+    const Source* src = p_.tensors.source_of(w);
+    if (!src || n <= 0 || w->ne[2] <= 1) return nullptr;
+    for (int64_t i = 0; i < n; ++i) {
+        if (experts[i] < 0 || experts[i] >= w->ne[2]) return nullptr;   // never guess
+    }
+    const uint64_t stride = static_cast<uint64_t>(w->nb[2]);
+    const uint64_t need = stride * static_cast<uint64_t>(w->ne[2]);
+    const RegionGeom g = region_geom(*src, stride, need);
+
+    uint8_t* data = nullptr;
+    CopySlot& slot = copy_slots_[copy_kind(w)];
+    // The slot holds this tensor with this routing: read ahead (wait for it) or still
+    // there from an earlier copy (its contents are unchanged since).
+    const bool same = slot.data && slot.w == w && slot.experts.size() == static_cast<size_t>(n) &&
+                      std::equal(slot.experts.begin(), slot.experts.end(), experts);
+    const bool was_pending = slot.pending;
+    const bool ok = settle_slot(slot);
+    if (same && ok && slot.mem) {
+        ++copy_prefetch_hits_;
+        if (!was_pending) p_.hits.add_routed(static_cast<uint64_t>(n) * stride, 0);   // served from RAM
+        *mem = slot.data;
+        *bytes = 0;
+        return slot.data;
+    }
+    if (was_pending) ++copy_prefetch_misses_;
+    slot.w = nullptr;
+    if ((data = landing_in(slot.mem, slot.bytes, g.bytes, g.align, g.head)) != nullptr) {
+        *mem = data;
+        *bytes = 0;
+    } else {
+        uint32_t head = 0;
+        if (!alloc_region(*src, stride, need, mem, bytes, &head, nullptr)) return nullptr;
+        data = *mem + head;
+    }
+    const uint64_t dstride = src->disk_stride ? src->disk_stride : stride;
+    std::vector<Slice> slices;
+    slices.reserve(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t e = experts[i];
+        uint8_t* dst = data + static_cast<uint64_t>(e) * stride;
+        if (const void* c = p_.slots.hit(w, e)) {
+            std::memcpy(dst, c, static_cast<size_t>(stride));
+            continue;
+        }
+        Slice s;
+        s.src = *src;
+        s.src.offset += static_cast<uint64_t>(e) * dstride;
+        s.dst = dst;
+        s.len = stride;
+        slices.push_back(s);
+    }
+    if (!slices.empty() && !p_.io.read_batch(slices)) {
+        if (*bytes) p_.mem.free(mem::Category::ExpertCache, *mem, *bytes);
+        return nullptr;
+    }
+    const uint64_t read = static_cast<uint64_t>(slices.size()) * stride;
+    *streamed += read;
+    p_.hits.add_routed(static_cast<uint64_t>(n) * stride, read);
+    if (*bytes == 0) {   // landed in the slot: remember what it holds
+        slot.w = w;
+        slot.experts.assign(experts, experts + n);
+        slot.data = data;
+    }
+    return data;
+}
+
+void ExpertCompactor::prefetch_copy_siblings(ggml_tensor* w, const int32_t* experts, int64_t n,
+                                             uint64_t* streamed) {
+    static const char* kinds[kCopyKinds] = {"_gate_exps", "_up_exps", "_down_exps"};
+    const int mine = copy_kind(w);
+    if (!std::strstr(w->name, kinds[mine])) return;   // fused or unnamed: no siblings known
+    for (int k = 0; k < kCopyKinds; ++k) {
+        if (k == mine) continue;
+        CopySlot& slot = copy_slots_[k];
+        if (!slot.mem) continue;
+        std::string name(w->name);
+        name.replace(name.find(kinds[mine]), std::strlen(kinds[mine]), kinds[k]);
+        ggml_tensor* sib = p_.tensors.named(name);
+        const Source* src = sib ? p_.tensors.source_of(sib) : nullptr;
+        if (!src || sib->ne[2] <= 1) continue;
+        if (const Resident* r = p_.cache.find(sib); r && r->mem && r->uniq.empty()) continue;   // whole in RAM
+        bool in_range = true;
+        for (int64_t i = 0; i < n && in_range; ++i) in_range = experts[i] >= 0 && experts[i] < sib->ne[2];
+        if (!in_range) continue;
+        // Already there (read ahead, or copied earlier with this routing): nothing to do.
+        if (slot.w == sib && slot.experts.size() == static_cast<size_t>(n) &&
+            std::equal(slot.experts.begin(), slot.experts.end(), experts)) {
+            continue;
+        }
+        settle_slot(slot);   // an unclaimed read-ahead: its slot is about to be reused
+        slot.w = nullptr;
+        if (!slot.mem) continue;
+        const uint64_t stride = static_cast<uint64_t>(sib->nb[2]);
+        const RegionGeom g = region_geom(*src, stride, stride * static_cast<uint64_t>(sib->ne[2]));
+        uint8_t* data = landing_in(slot.mem, slot.bytes, g.bytes, g.align, g.head);
+        if (!data) continue;
+        const uint64_t dstride = src->disk_stride ? src->disk_stride : stride;
+        uint64_t misses = 0;
+        bool fail = false;
+        for (int64_t i = 0; i < n && !fail; ++i) {
+            const int32_t e = experts[i];
+            uint8_t* dst = data + static_cast<uint64_t>(e) * stride;
+            if (const void* c = p_.slots.hit(sib, e)) {
+                std::memcpy(dst, c, static_cast<size_t>(stride));
+                continue;
+            }
+            Source s = *src;
+            s.offset += static_cast<uint64_t>(e) * dstride;
+            fail = !p_.io.submit_exact(s, dst, stride, &slot.tags);
+            ++misses;
+        }
+        slot.pending = true;   // even on a failed submit: what was submitted must settle
+        if (fail) {
+            settle_slot(slot);
+            continue;
+        }
+        slot.w = sib;
+        slot.experts.assign(experts, experts + n);
+        slot.data = data;
+        *streamed += misses * stride;
+        p_.hits.add_routed(static_cast<uint64_t>(n) * stride, misses * stride);
+    }
 }
 
 }  // namespace dray::backend

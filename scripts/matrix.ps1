@@ -50,8 +50,6 @@ $models = @(
      caps=@("4G","8G","20G"); ctxs=@(4096,32768) },
   @{ n="qwen36-35b-a3b";   p="D:\Models\unsloth\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf";
      caps=@("3G","8G","28G"); ctxs=@(4096,32768) },
-  @{ n="qwen35-122b-a10b"; p="D:\Models\unsloth\Qwen3.5-122B-A10B-GGUF\Qwen3.5-122B-A10B-UD-Q2_K_XL.gguf";
-     caps=@("3G","12G","28G"); ctxs=@(4096,32768) },
   @{ n="deepseek-v4-flash"; p="D:\Models\unsloth\DeepSeek-V4-Flash-0731-GGUF\UD-Q2_K_XL\DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf";
      caps=@("3G","8G","24G"); ctxs=@(4096,32768) },
   @{ n="minimax-m3";       p="D:\Models\unsloth\MiniMax-M3-GGUF\UD-Q2_K_XL\MiniMax-M3-UD-Q2_K_XL-00001-of-00004.gguf";

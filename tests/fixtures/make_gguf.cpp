@@ -86,6 +86,7 @@ const char* fixture_class_name(FixtureClass c) {
         case FixtureClass::NormOrBias:        return "NormOrBias";
         case FixtureClass::RoutedExpert:      return "RoutedExpert";
         case FixtureClass::UnconditionalBulk: return "UnconditionalBulk";
+        case FixtureClass::RowSliced:         return "RowSliced";
     }
     return "?";
 }
@@ -301,7 +302,7 @@ Fixture make_gguf(const std::filesystem::path& dir, const std::string& filename,
                                   : n_embd;
     const int64_t n_experts = static_cast<int64_t>(spec.n_experts);
 
-    b.add(FixtureClass::UnconditionalBulk, -1, GGML_TYPE_Q8_0, "token_embd.weight", n_embd,
+    b.add(FixtureClass::RowSliced, -1, GGML_TYPE_Q8_0, "token_embd.weight", n_embd,
           static_cast<int64_t>(spec.n_vocab), 1);
 
     fx.layers.resize(spec.n_layers);
@@ -440,6 +441,7 @@ Fixture make_gguf(const std::filesystem::path& dir, const std::string& filename,
             case FixtureClass::NormOrBias:        fx.norm_bias_bytes += t.bytes; break;
             case FixtureClass::RoutedExpert:      fx.routed_bytes += t.bytes; break;
             case FixtureClass::UnconditionalBulk: fx.unconditional_bytes += t.bytes; break;
+            case FixtureClass::RowSliced:         fx.row_sliced_bytes += t.bytes; break;
         }
     }
     for (const FixtureLayer& l : fx.layers) {

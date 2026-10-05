@@ -60,9 +60,40 @@ void* ResidencyCache::take_region(uint64_t bytes, uint32_t align) {
     return nullptr;
 }
 
+void* ResidencyCache::reclaim_own(const ggml_tensor* t, uint64_t bytes, uint32_t align,
+                                  Mismatch on_mismatch) {
+    auto r = entries_.find(t);
+    if (r == entries_.end()) return nullptr;
+    const Resident& e = r->second;
+    const bool fits = !e.pinned && e.prio == Prio::RoutedExpert && e.bytes == bytes &&
+                      e.cat == mem::Category::ExpertCache && e.mem &&
+                      (!align || reinterpret_cast<uintptr_t>(e.mem) % align == 0);
+    if (!fits) {
+        if (on_mismatch == Mismatch::Drop) drop(t);
+        return nullptr;
+    }
+    void* m = e.mem;
+    entries_.erase(r);
+    lru_.remove(t);
+    // As everywhere a region leaves the cache: back to the sentinel, never left
+    // pointing at bytes about to be overwritten with another routing's experts.
+    const_cast<ggml_tensor*>(t)->data = poison_.sentinel();
+    ++regions_recycled_;
+    return m;
+}
+
 bool ResidencyCache::make_room(uint64_t need) {
     for (int pass = 0; pass < 2 && mem_.cache_used() + need > mem_.cache_budget(); ++pass) {
         const Prio evictable = (pass == 0) ? Prio::RoutedExpert : Prio::Unconditional;
+        // Between the passes: the slot pool gives back what it can. A committed
+        // pool that could not be asked was what made batch runs die with
+        // "nothing evictable" (M3 28G B=16, 2026-08-20).
+        if (pass == 1 && spill_) {
+            const uint64_t used = mem_.cache_used(), budget = mem_.cache_budget();
+            const uint64_t short_by = used + need > budget ? used + need - budget : 0;
+            if (short_by) spill_->release(short_by);
+            if (mem_.cache_used() + need <= mem_.cache_budget()) break;
+        }
         while (mem_.cache_used() + need > mem_.cache_budget() && !lru_.empty()) {
             bool evicted = false;
             for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {

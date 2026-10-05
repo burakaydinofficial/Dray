@@ -179,7 +179,7 @@ LZ_TEST(the_totals_the_planner_has_to_reproduce_are_self_consistent) {
         sum += t.bytes;
     }
     LZ_CHECK_EQ(sum, fx.router_gate_bytes + fx.norm_bias_bytes + fx.routed_bytes +
-                         fx.unconditional_bytes);
+                         fx.unconditional_bytes + fx.row_sliced_bytes);
     LZ_CHECK_LE(sum, fx.file_size);
 
     // Routed experts must dominate: a fixture where they do not is not a model

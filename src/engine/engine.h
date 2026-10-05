@@ -4,8 +4,9 @@
 // DESIGN -- it is the differential test's reference half and must not share the
 // code it checks.
 //
-// Serialized admission is the caller's job (Invariant 7): generate() assumes one
-// generation at a time, and the server holds a mutex across each request.
+// generate() is the single-stream path (run, snaptest): it assumes nothing else
+// uses the context. The server never calls it -- every server generation is a
+// request to engine::Scheduler, whose thread alone touches the model.
 //
 // OWNERSHIP. Engine owns, in construction order: the Plan, the Accountant (the
 // cap ledger), the Streamer (the weight streaming machinery), the merged GGUF
@@ -18,12 +19,15 @@
 #include <memory>
 #include <string>
 
+#include "config/settings.h"
 #include "engine/engine_types.h"
 #include "engine/streamed_text.h"
 
 struct llama_model;
 struct llama_context;
 struct llama_vocab;
+struct llama_context_params;
+struct ggml_threadpool;
 namespace dray::mem { class Accountant; }
 namespace dray::plan { struct Plan; }
 namespace dray::backend { class Streamer; struct MergedMetadata; }
@@ -54,6 +58,7 @@ public:
     llama_context*     context() const { return lctx_; }
     const llama_vocab* vocab() const   { return vocab_; }
     const llama_model* model() const   { return model_; }
+    const config::Settings& settings() const { return settings_; }
 
     // --- readouts. Read counters only when no generation is running, or from
     //     the generating thread: the underlying streamer counters are plain
@@ -75,6 +80,12 @@ public:
 
     // --- for the generators in this module (BatchGenerator, CohortRotator).
     uint32_t funded_sequences() const;   // sequences the admission funded
+    // One sequence's recurrent state (the planner's figure; 0 = attention only):
+    // the size of one recurrent checkpoint, before serializer framing.
+    uint64_t recurrent_state_per_sequence() const;
+    // Memory the streamer can do without (the expert slot pool): the ceiling for
+    // other optional caches, such as parked conversations.
+    uint64_t spare_cache_bytes() const;
     int32_t prefill_chunk() const { return prefill_batch_; }
     bool weights_failed() const;         // a weight failed to materialise
     void note_progress(int32_t tokens) { live_tokens_.store(tokens, std::memory_order_relaxed); }
@@ -94,7 +105,14 @@ private:
     bool verify_floor(std::string* error);
     bool check_storage_backend(std::string* error);
     bool create_context(const EngineConfig& config, bool gpu_consent, std::string* error);
+    // --gpu: the context whose VRAM use fits the hard VRAM limit (gpu.vram_cap,
+    // --vram-cap), the prefill chunk halved until it does, or a refusal naming
+    // the VRAM it needs. Sets prefill_batch_ to the chunk it settled on.
+    bool create_gpu_context(llama_context_params* cp, std::string* error);
     bool reserve_checkpoint_allowance(const EngineConfig& config, std::string* error);
+    // --gpu: pinned landing memory for routed-expert GPU copies, charged to the cap
+    // (IoStaging) or refused with its price. Nothing when the experts stay cached.
+    bool reserve_gpu_copy_pool(bool gpu_consent, std::string* error);
     bool admit(const EngineConfig& config, std::string* error);
 
     // T13: written per token by the generating thread, readable lock-free by
@@ -110,6 +128,11 @@ private:
     std::unique_ptr<LoadState>               load_;   // see engine_internal.h
     llama_model*       model_ = nullptr;
     llama_context*     lctx_ = nullptr;
+    // Persistent CPU thread pools (decode, prefill) attached to lctx_, as stock
+    // llama.cpp does (see attach_threadpools). Freed after lctx_.
+    struct ggml_threadpool* tp_decode_ = nullptr;
+    struct ggml_threadpool* tp_prefill_ = nullptr;
+    void attach_threadpools(int n_decode, int n_prefill);
     const llama_vocab* vocab_ = nullptr;
 
     std::string model_id_;
@@ -120,6 +143,9 @@ private:
     // GGML_ASSERT(n_tokens <= n_batch) -- an abort, not an error return -- so
     // prompts are decoded in chunks of exactly this many tokens.
     int32_t     prefill_batch_ = 512;
+    // The resolved tuning settings (built-in / system / model / CLI), each
+    // with its source; the only place open() reads tuning values from.
+    config::Settings settings_;
 };
 
 }  // namespace dray::engine

@@ -123,7 +123,8 @@ int cmd_verify(const Args& a) {
     // half left the more damaging half unchecked.
     size_t un_checked = 0, un_mismatched = 0, un_skipped = 0;
     for (const dray::plan::TensorInfo& t : p.tensors) {
-        if (t.cls != dray::plan::TensorClass::UnconditionalBulk) continue;
+        if (t.cls != dray::plan::TensorClass::UnconditionalBulk &&
+            t.cls != dray::plan::TensorClass::RowSliced) continue;
         if (t.bytes == 0) continue;
         const size_t si = static_cast<size_t>(t.shard >= 0 ? t.shard : 0);
         if (si >= handles.size() || handles[si] == dray::io::kInvalidFile) { ++un_skipped; continue; }

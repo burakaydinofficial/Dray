@@ -46,10 +46,6 @@ struct Resident {
     uint64_t bytes = 0;
     uint32_t refs = 0;
     bool     pinned = false;
-    // A: bytes were rewritten into ggml-cpu's interleaved layout so the
-    // optimised matmul kernels accept them. Such a tensor no longer matches
-    // the file byte-for-byte, so self_check must skip it and SAY it skipped.
-    bool     repacked = false;
     Prio     prio = Prio::Unconditional;
     // Which ledger line this memory is charged to, so releasing it credits the
     // same category that reserving it debited. Getting this wrong would drift the
@@ -66,6 +62,18 @@ struct Resident {
     // so reuse is gated on the ordering matching, not on recency. Empty means a
     // whole tensor, valid for any routing.
     std::vector<int32_t> uniq;
+};
+
+// Memory held outside the LRU that the cache may ask back under pressure: the
+// expert slot pool. Asked after dead expert regions and before unconditional
+// weights -- a pinned unconditional byte saves a read on EVERY token, a slot
+// only when its expert is picked again.
+class SpillSource {
+public:
+    virtual ~SpillSource() = default;
+    // Frees at least `bytes` if it can (its least valuable first); returns the
+    // bytes freed.
+    virtual uint64_t release(uint64_t bytes) = 0;
 };
 
 class ResidencyCache final : public Reclaimer {
@@ -122,6 +130,8 @@ public:
     // back at the sentinel. True when the bytes now fit.
     bool make_room(uint64_t need);
     bool reclaim(uint64_t bytes) override { return make_room(bytes); }
+    // The slot pool, consulted by make_room between its two passes (see SpillSource).
+    void set_spill(SpillSource* s) { spill_ = s; }
 
     // Hands over the memory of a dead routed-expert region of EXACTLY `bytes`
     // (least recent first, never pinned or protected), removing it from the
@@ -131,6 +141,23 @@ public:
     // free+alloc per region cost K3 30 s per 16-token run. Null when none fits.
     void* take_region(uint64_t bytes, uint32_t align);
     uint64_t regions_reused() const { return regions_reused_; }
+    // `t`'s OWN region, handed back for its replacement instead of freed: the
+    // caller is about to give `t` a new region of exactly `bytes` at `align`
+    // (a new routing for the same expert tensor). The pages are committed and
+    // touched already, so the replacement skips the free, the fresh commit and
+    // the OS zero-fill of every page; the ledger charge carries over. Protection
+    // is not consulted: replacing its own region is exactly what the current
+    // node is doing.
+    //
+    // On a MISMATCH (size, alignment, class, pinned) nullptr is returned and the
+    // entry is either freed (`Mismatch::Drop`: the caller replaces it now, as the
+    // node's own compaction always did) or left exactly where it is
+    // (`Mismatch::Keep`: a sibling submitted ahead of its node, which never
+    // touched the old entry -- the node decides later. Dropping there discarded
+    // whole resident tensors under COMPACT_ALL: h_routed 94% -> 13%.)
+    enum class Mismatch { Drop, Keep };
+    void* reclaim_own(const ggml_tensor* t, uint64_t bytes, uint32_t align, Mismatch on_mismatch);
+    uint64_t regions_recycled() const { return regions_recycled_; }
 
     // Rebudget support. When the budget contracts under them, static pins become
     // an over-claim nothing can evict (measured on Linux: 3.27 GB pinned of 2.39
@@ -153,6 +180,7 @@ public:
 private:
     uint64_t evictions_ = 0, evicted_bytes_ = 0, ns_evict_free_ = 0;
     uint64_t regions_reused_ = 0;
+    uint64_t regions_recycled_ = 0;
     AccountedAlloc&               mem_;
     const PoisonBuffers&          poison_;
     const TensorRegistry&         tensors_;
@@ -160,6 +188,7 @@ private:
     std::list<const ggml_tensor*> lru_;       // front = newest
     uint64_t                      static_used_ = 0;
     uint64_t                      churn_reserve_ = 0;
+    SpillSource*                  spill_ = nullptr;
     std::vector<ggml_tensor*>     current_;   // mutable: materialise rewrites ->data
 };
 

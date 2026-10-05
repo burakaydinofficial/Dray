@@ -96,22 +96,30 @@ generated tokens, one methodology and one build. Reproduce with
 `scripts/matrix-results.csv`. Earlier versions of this table mixed figures taken
 from different builds and prompts, which is why several rows moved.
 
-**Prefill is a different workload** and gets its own column. 6,594-token prompt,
-tokens per second:
+**Prefill is a different workload**, and `--gpu` exists for it.
 
-| model | cap | CPU | with `--gpu` |
-|---|---|---|---|
-| Qwen3.6 35B-A3B | 8 GiB | 12.8 | **343.4** |
-| Qwen3.6 35B-A3B | 28 GiB | 15.3 | **180.7** |
-| Qwen3.5 122B-A10B | 12 GiB | 4.0 | **280.6** |
-| Qwen3.5 122B-A10B | 28 GiB | 4.0 | **289.2** |
-| Qwen3.8-27B dense | 8 GiB | 2.5 | REFUSED |
-| DeepSeek V4 Flash 284B | 24 GiB | 2.6 | REFUSED |
-
-A REFUSED cell means the engine would not admit that configuration and said so
-at load with the cap it needed, not that it went unmeasured. At 32k context the
-GPU path needs more than the dense 27B or DeepSeek were given here, which is
-the same floor-raising effect described below.
+> **Correction (2026-09-30).** This section used to show `--gpu` prefill at
+> 180-343 tokens/second (12x-72x CPU). Those figures are WITHDRAWN: on the
+> streaming path every `--gpu` run computed on garbage. ggml's scheduler copies
+> a GPU split's weights straight from host memory before our streaming callback
+> runs, so weights not yet loaded went to the GPU as poison -- wrong text, exit
+> 0, no failure counted -- and no gate ran `--gpu`. Fixed on 2026-09-30 (a copy
+> callback in our llama.cpp fork loads each weight before it is copied), and
+> `scripts/gpugate.ps1` now proves `--gpu` bit-identical to llama.cpp's own GPU
+> path on every architecture that fits resident here.
+>
+> Corrected figures so far (2026-10-01, High performance plan, a 2.3k-token
+> prompt, defaults: the automatic 1.94 GiB VRAM limit chooses the chunk).
+> Seconds until generation starts, both including ~5 s of load:
+>
+> | model | cap | CPU | `--gpu` | GB read CPU / GPU |
+> |---|---|---|---|---|
+> | Qwen3.6 35B-A3B | 12 GiB | 133.9 | **16.8** (1024-token chunks) | 105.6 / 66.6 |
+> | Qwen3.8-27B dense | 16 GiB | 707.1 | **33.4 / 32.3** (512-token chunks) | 54.5 / 71.1 |
+>
+> The dense model's GPU path reads more: every weight is copied per chunk, while
+> the CPU path keeps part of the model cached. The other models will be
+> re-measured before this table grows.
 
 GPU decode LOSES on every model measured, in all fifteen comparable pairs, so
 `--gpu` is worth flipping for prompt-heavy work and not otherwise. It also
@@ -235,10 +243,13 @@ dray batch -m model.gguf --cap 28G --batch 32 --prompts many.txt -n 200 \
     --rotate 200 --state-dir E:/scratch
 ```
 
-The server is deliberately boring: OpenAI protocol only, one generation at a time
-(admission is serialized by design), background jobs that checkpoint and survive a
-kill. Greedy jobs resume with text identical to an uninterrupted run; sampled jobs
-resume plausibly on a disclosed seed. A vanished streaming client stops the disk
+The server is deliberately boring: OpenAI protocol only -- tool calls and
+reasoning_content included, through the model's own chat template, so agents
+such as Cline work -- `--parallel N` requests generating together (each with
+its own context, all funded inside `--cap` at load; the rest queue), and
+background jobs that checkpoint and survive a kill. Greedy jobs resume with
+text identical to an uninterrupted run; sampled jobs resume plausibly on a
+disclosed seed. A vanished streaming client stops the disk
 within one token (non-streaming requests run to completion; the job API is the
 right tool for long work). Failures and taint are reported on every response
 surface, because serving

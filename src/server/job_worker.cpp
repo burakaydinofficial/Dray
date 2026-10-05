@@ -11,6 +11,7 @@
 
 #include "cache/snapshot_cache.h"
 #include "engine/engine.h"
+#include "engine/scheduler.h"
 #include "server/job_registry.h"
 #include "server/job_store.h"
 #include "server/shutdown.h"
@@ -62,7 +63,8 @@ public:
 
     uint64_t prev_hash = 0;   // the live checkpoint; discarded on completion
 
-    void on_safepoint(int32_t next_tok, int32_t true_done);
+    // `seq`: the scheduler slot (llama sequence) holding this job.
+    void on_safepoint(int32_t seq, int32_t next_tok, int32_t true_done);
 
 private:
     ServerContext& ctx_;
@@ -74,7 +76,7 @@ private:
     std::chrono::steady_clock::time_point last_;
 };
 
-void Checkpointer::on_safepoint(int32_t next_tok, int32_t true_done) {
+void Checkpointer::on_safepoint(int32_t seq, int32_t next_tok, int32_t true_done) {
     JobRegistry& jobs = *ctx_.jobs;
     // T7: the engine's second argument is the TRUE decoded-token count.
     // job->tokens_out counts token_cb invocations, which UTF-8 hold-back merges
@@ -103,7 +105,7 @@ void Checkpointer::on_safepoint(int32_t next_tok, int32_t true_done) {
     last_ = nowt;
     std::string serr2;
     cache::SnapshotCache& snap = ctx_.store->checkpoints();
-    if (!snap.store(h, static_cast<uint64_t>(done), ctx_.engine->context(), 0,
+    if (!snap.store(h, static_cast<uint64_t>(done), ctx_.engine->context(), seq,
                     cache::Retention::Pinned, &serr2)) {
         std::fprintf(stderr, "serve: ckpt store failed: %s\n", serr2.c_str());
         auto lk2 = jobs.lock();
@@ -149,14 +151,16 @@ void Checkpointer::on_safepoint(int32_t next_tok, int32_t true_done) {
 
 enum class Restore { Resumed, Deferred, RestartFromPrompt };
 
-// Restores a resumed job's checkpoint into the live context, or decides why not.
+// Restores a resumed job's checkpoint into sequence `seq` of the live context,
+// or decides why not. Runs on the scheduler's thread (Request::restore).
 Restore restore_checkpoint(ServerContext& ctx, const std::string& id, const std::shared_ptr<Job>& job,
-                           GenParams& gp, std::string& text_base, uint64_t& prev_hash) {
+                           GenParams& gp, std::string& text_base, uint64_t& prev_hash,
+                           int32_t seq) {
     JobRegistry& jobs = *ctx.jobs;
     cache::SnapshotCache& snap = ctx.store->checkpoints();
     auto entry = snap.lookup(job->resume_hash);
     std::string lerr;
-    if (entry && snap.load(*entry, ctx.engine->context(), 0, &lerr)) {
+    if (entry && snap.load(*entry, ctx.engine->context(), seq, &lerr)) {
         gp.resume = true;
         gp.resume_pending = job->resume_pending;
         // F5: the engine reports session-local indices; this base makes every
@@ -243,59 +247,24 @@ void JobWorker::run() {
     }
 }
 
-void JobWorker::process(const std::string& id, const std::shared_ptr<Job>& job) {
-    JobRegistry& jobs = *ctx_.jobs;
-    auto jobs_sp = ctx_.jobs;
+namespace {
 
-    GenParams gp = job->gp;
-    // Shutdown must also stop the worker's generation, even when listen()
-    // returned for a reason other than the watcher (2026-08-24 audit).
-    gp.should_continue = [job, jobs_sp] {
-        return !job->cancel.load(std::memory_order_relaxed) && !jobs_sp->stopping();
-    };
-    // F14: prompt tokens for usage.
-    gp.on_prefill = [job, jobs_sp](int32_t np) {
-        auto lk = jobs_sp->lock();
-        job->tokens_in = np;
-    };
-    // F8: the resumed prefix; the final registry text is this + the session's
-    // authoritative r.text.
-    std::string text_base;
-    {
-        auto lk = jobs.lock();
-        text_base = job->text;
-    }
-    Checkpointer ckpt(ctx_, id, job, gp, ckpt_every_);
+// One job's session. Its Request callbacks run on the scheduler's thread after
+// process() has returned, so everything they touch lives here, shared.
+struct JobRun {
+    ServerContext ctx;
+    std::string   id;
+    std::shared_ptr<Job> job;
+    GenParams     gp;          // what the session runs with; restore adjusts it
+    std::string   text_base;   // F8: the resumed prefix
+    std::unique_ptr<Checkpointer> ckpt;   // refers to gp, id, job above
+    bool          deferred = false;       // restore deferred: state already recorded
+};
 
-    std::lock_guard<std::mutex> gen(*ctx_.gate);
-
-    if (job->resume && ctx_.store) {
-        if (restore_checkpoint(ctx_, id, job, gp, text_base, ckpt.prev_hash) == Restore::Deferred) {
-            return;
-        }
-    }
-    if (ctx_.store) {
-        gp.on_safepoint = [&ckpt](int32_t next_tok, int32_t true_done) {
-            ckpt.on_safepoint(next_tok, true_done);
-        };
-    }
-    if (!job->orig_max) job->orig_max = gp.max_tokens;
-
-    // Swarm S2: nothing thrown below may escape this thread -- an uncaught
-    // exception here is std::terminate for the whole server.
-    GenResult r;
-    try {
-        r = ctx_.engine->generate(gp, [&](const std::string& piece) {
-            auto lk = jobs.lock();
-            job->text += piece;
-            ++job->tokens_out;
-        });
-    } catch (const std::exception& ex) {
-        r.error = std::string("internal: ") + ex.what();
-    } catch (...) {
-        r.error = "internal: unknown exception";
-    }
-
+// A job's terminal state, from the session's result.
+void finalize(JobRun& run, GenResult r) {
+    JobRegistry& jobs = *run.ctx.jobs;
+    const std::shared_ptr<Job>& job = run.job;
     // T1: checkpoint state is destroyed only on genuine completion or an
     // EXPLICIT user cancel; shutdown-cancel and failures keep it for resume.
     bool user_cancelled;
@@ -307,19 +276,20 @@ void JobWorker::process(const std::string& id, const std::shared_ptr<Job>& job) 
         user_cancelled = r.cancelled && !jobs.stopping() && !stop_requested();
     }
     const bool done_clean = r.error.empty() && !r.aborted && !r.cancelled;
-    if (ctx_.store && (done_clean || user_cancelled)) {
-        ctx_.store->remove_sidecar(id);
-        if (ckpt.prev_hash) ctx_.store->checkpoints().discard(ckpt.prev_hash);
+    if (run.ctx.store && (done_clean || user_cancelled)) {
+        run.ctx.store->remove_sidecar(run.id);
+        if (run.ckpt->prev_hash) run.ctx.store->checkpoints().discard(run.ckpt->prev_hash);
     }
     auto lk = jobs.lock();
+    // F14: prompt tokens for usage (0 on a resume: unknown there, T9).
+    if (r.tokens_in > 0) job->tokens_in = r.tokens_in;
     // T7/F5: the engine's true count, made absolute across restarts.
-    job->tokens_out = gp.resume_tokens_done + r.tokens_out;
+    job->tokens_out = run.gp.resume_tokens_done + r.tokens_out;
     // F8: r.text is the authority for THIS session; base_trim is the resume
     // straddle, where the stop began inside text_base.
-    if (r.base_trim > 0 && r.base_trim <= text_base.size()) {
-        text_base.erase(text_base.size() - r.base_trim);
-    }
-    job->text = text_base + r.text;
+    std::string base = run.text_base;
+    if (r.base_trim > 0 && r.base_trim <= base.size()) base.erase(base.size() - r.base_trim);
+    job->text = base + r.text;
     // Swarm S1+S7: aborted counts as failed, and the error must not destroy the
     // partial output. A shutdown-cancel is NOT terminal: "interrupted", and the
     // next boot resumes it.
@@ -328,6 +298,88 @@ void JobWorker::process(const std::string& id, const std::shared_ptr<Job>& job) 
     job->finished_at = std::chrono::steady_clock::now();
     if (!r.error.empty()) job->error = r.error;
     else if (r.aborted) job->error = "aborted: a weight failed to materialise; output untrustworthy";
+}
+
+void fail_job(JobRun& run, const std::string& why) {
+    auto lk = run.ctx.jobs->lock();
+    run.job->status = "failed";
+    run.job->error = why;
+    run.job->finished_at = std::chrono::steady_clock::now();
+}
+
+}  // namespace
+
+// Submits the job and returns: the scheduler runs it in a slot of its own,
+// alongside foreground requests and other jobs. Swarm S2: nothing thrown in a
+// callback may escape onto the scheduler's thread -- it serves everyone.
+void JobWorker::process(const std::string& id, const std::shared_ptr<Job>& job) {
+    auto run = std::make_shared<JobRun>();
+    run->ctx = ctx_;
+    run->id = id;
+    run->job = job;
+    run->gp = job->gp;
+    auto jobs_sp = ctx_.jobs;
+    // Shutdown must also stop the job's generation, even when listen()
+    // returned for a reason other than the watcher (2026-08-24 audit).
+    run->gp.should_continue = [job, jobs_sp] {
+        return !job->cancel.load(std::memory_order_relaxed) && !jobs_sp->stopping();
+    };
+    {
+        auto lk = ctx_.jobs->lock();
+        run->text_base = job->text;
+    }
+    run->ckpt = std::make_unique<Checkpointer>(run->ctx, run->id, run->job, run->gp, ckpt_every_);
+    if (!job->orig_max) job->orig_max = run->gp.max_tokens;
+
+    engine::Request q;
+    q.params = run->gp;
+    q.sink = [run](const std::string& piece) {
+        auto lk = run->ctx.jobs->lock();
+        run->job->text += piece;
+        ++run->job->tokens_out;
+    };
+    if (job->resume && ctx_.store) {
+        q.restore = [run](int32_t seq, GenParams& p) {
+            try {
+                const Restore how = restore_checkpoint(run->ctx, run->id, run->job, p,
+                                                       run->text_base, run->ckpt->prev_hash, seq);
+                run->gp = p;   // the checkpointer and finalize see the resumed session
+                if (how == Restore::Deferred) {
+                    run->deferred = true;
+                    return engine::Restored::Abandon;
+                }
+                return how == Restore::Resumed ? engine::Restored::Resumed : engine::Restored::Prefill;
+            } catch (const std::exception& ex) {
+                fail_job(*run, std::string("internal: restore: ") + ex.what());
+            } catch (...) {
+                fail_job(*run, "internal: restore: unknown exception");
+            }
+            run->deferred = true;   // terminal state already recorded
+            return engine::Restored::Abandon;
+        };
+    }
+    if (ctx_.store) {
+        q.safepoint = [run](int32_t seq, int32_t next_tok, int32_t done) {
+            try {
+                run->ckpt->on_safepoint(seq, next_tok, done);
+            } catch (const std::exception& ex) {
+                std::fprintf(stderr, "serve: job %s checkpoint threw: %s\n", run->id.c_str(), ex.what());
+            } catch (...) {
+                std::fprintf(stderr, "serve: job %s checkpoint threw\n", run->id.c_str());
+            }
+        };
+    }
+    q.done = [run](GenResult r) {
+        if (run->deferred) return;
+        try {
+            finalize(*run, std::move(r));
+        } catch (const std::exception& ex) {
+            fail_job(*run, std::string("internal: ") + ex.what());
+        } catch (...) {
+            fail_job(*run, "internal: unknown exception");
+        }
+    };
+    ctx_.sched->submit(std::move(q));
 }
 
 }  // namespace dray::server

@@ -44,8 +44,6 @@ $models = @(
        path = "D:\Models\unsloth\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-Q4_K_XL.gguf" },
     @{ name = "qwen36-35b-a3b"; why = "sparse MoE, 256 experts top-8";
        path = "D:\Models\unsloth\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf" },
-    @{ name = "qwen35-122b-a10b"; why = "sparse MoE, 256 experts top-8, 48 layers";
-       path = "D:\Models\unsloth\Qwen3.5-122B-A10B-GGUF\Qwen3.5-122B-A10B-UD-Q2_K_XL.gguf" },
     @{ name = "deepseek-v4-flash"; why = "HYPER-CONNECTIONS + MLA, 256 experts top-6";
        path = "D:\Models\unsloth\DeepSeek-V4-Flash-0731-GGUF\UD-Q2_K_XL\DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf" }
 )

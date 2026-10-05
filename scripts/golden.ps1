@@ -6,7 +6,7 @@
 #                compaction, unlocks, eslot hits, hit rates)
 # The suite covers every command (plan, run, batch, rotate, snaptest, refusal)
 # and one run per streamer lever (NO_FUSE, NO_EARLY, NO_RETAIN, NO_ESLOTS,
-# NO_REUSE, COMPACT_ALL, NO_ROWSLICE, FAST_NODES, RING_MB=0, NO_POOL, REPACK):
+# NO_REUSE, COMPACT_ALL, NO_ROWSLICE, FAST_NODES, RING_MB=0, NO_POOL, IO_THREAD=0):
 # a lever not exercised by a gate is a path nobody checked.
 #
 #   golden.ps1 -OutDir before            # with the binary you trust
@@ -71,7 +71,7 @@ $levers = [ordered]@{
     "lv_noreuse" = @{ NO_REUSE = "1" };    "lv_compactall" = @{ COMPACT_ALL = "1" }
     "lv_norowslice" = @{ NO_ROWSLICE = "1" }; "lv_fastnodes" = @{ FAST_NODES = "1" }
     "lv_noring" = @{ RING_MB = "0" };      "lv_nopool" = @{ NO_POOL = "1" }
-    "lv_repack" = @{ REPACK = "1" };        "lv_noiothread" = @{ IO_THREAD = "0" }
+    "lv_noiothread" = @{ IO_THREAD = "0" }
 }
 foreach ($ln in $levers.Keys) {
     $e = @{}; foreach ($k in $levers[$ln].Keys) { $e["$EnvPrefix$k"] = $levers[$ln][$k] }

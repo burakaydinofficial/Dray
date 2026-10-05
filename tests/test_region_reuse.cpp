@@ -122,3 +122,45 @@ LZ_TEST(refuses_a_region_not_aligned_as_asked) {
     LZ_CHECK(r.cache.take_region(kRegion, strict * 2) == nullptr);
     LZ_CHECK(r.cache.take_region(kRegion, 4096) != nullptr);
 }
+
+LZ_TEST(a_tensor_recycles_its_own_region_for_its_next_routing) {
+    // reclaim_own: the replacement of a tensor's region takes the old memory
+    // when size and alignment match -- no free, no fresh commit, charge carried.
+    Rig r;
+    LZ_REQUIRE(r.ok);
+    void* old = r.add(0, kRegion, Prio::RoutedExpert);
+    r.add(1, kRegion, Prio::RoutedExpert);
+    r.cache.protect(r.ts[0]);                            // the current node's own tensor
+    const size_t used = r.acct.used();
+
+    void* got = r.cache.reclaim_own(r.ts[0], kRegion, 4096, ResidencyCache::Mismatch::Drop);
+    LZ_CHECK(got == old);                                // its own, even while protected
+    LZ_CHECK(r.cache.find(r.ts[0]) == nullptr);
+    LZ_CHECK(r.ts[0]->data == r.poison.sentinel());
+    LZ_CHECK(r.cache.find(r.ts[1]) != nullptr);          // never another tensor's
+    LZ_CHECK_EQ(r.acct.used(), used);                    // the charge carried over
+    LZ_CHECK_EQ(r.cache.regions_recycled(), 1u);
+    r.alloc.free(mem::Category::ExpertCache, got, kRegion);
+}
+
+LZ_TEST(a_region_that_does_not_fit_is_freed_as_before) {
+    Rig r;
+    LZ_REQUIRE(r.ok);
+    r.add(0, kRegion, Prio::RoutedExpert);
+    const size_t used = r.acct.used();
+    // A different size, Keep (a sibling ahead of its node): untouched -- still
+    // cached, still charged, nothing handed back.
+    LZ_CHECK(r.cache.reclaim_own(r.ts[0], kRegion + 4096, 4096,
+                                 ResidencyCache::Mismatch::Keep) == nullptr);
+    LZ_CHECK(r.cache.find(r.ts[0]) != nullptr);
+    LZ_CHECK_EQ(r.acct.used(), used);
+    // Drop (the node's own replacement): freed, exactly what the replacement
+    // did before reclaim_own existed.
+    LZ_CHECK(r.cache.reclaim_own(r.ts[0], kRegion + 4096, 4096,
+                                 ResidencyCache::Mismatch::Drop) == nullptr);
+    LZ_CHECK(r.cache.find(r.ts[0]) == nullptr);
+    LZ_CHECK_EQ(r.acct.used(), used - kRegion);
+    LZ_CHECK_EQ(r.cache.regions_recycled(), 0u);
+    // No region at all: nothing to do.
+    LZ_CHECK(r.cache.reclaim_own(r.ts[5], kRegion, 4096, ResidencyCache::Mismatch::Drop) == nullptr);
+}

@@ -45,6 +45,7 @@ enum class FixtureClass : uint8_t {
     NormOrBias,
     RoutedExpert,
     UnconditionalBulk,
+    RowSliced,          // gathered by rows only (token_embd beside a separate output.weight)
 };
 
 const char* fixture_class_name(FixtureClass);
@@ -118,6 +119,7 @@ struct Fixture {
     uint64_t norm_bias_bytes = 0;
     uint64_t routed_bytes = 0;
     uint64_t unconditional_bytes = 0;
+    uint64_t row_sliced_bytes = 0;
     uint32_t n_moe_layers = 0;
 
     const FixtureTensor* find(std::string_view name) const;

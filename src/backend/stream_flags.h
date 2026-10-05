@@ -31,7 +31,6 @@ struct StreamFlags {
 
     // Opt-ins.
     bool fast_nodes  = false;   // DRAY_FAST_NODES   skip nodes with no disk-backed source
-    bool repack      = false;   // DRAY_REPACK       repack whole 2D weights (measured -20%)
     bool metal       = false;   // DRAY_METAL        Apple: map the pool arena for Metal
 
     // Diagnostics.

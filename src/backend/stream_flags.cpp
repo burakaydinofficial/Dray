@@ -25,7 +25,6 @@ StreamFlags StreamFlags::from_env() {
     f.no_pool       = on("DRAY_NO_POOL");
     f.compact_all   = on("DRAY_COMPACT_ALL");
     f.fast_nodes    = on("DRAY_FAST_NODES");
-    f.repack        = on("DRAY_REPACK");
     f.metal         = on("DRAY_METAL");
     f.trace         = on("DRAY_TRACE");
     f.trace_compact = on("DRAY_TRACE_COMPACT");

@@ -10,18 +10,21 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <thread>
 
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "llama.h"
+#include "llama-ext.h"   // llama_get_memory_breakdown: what each device really holds
 
 #include "backend/stream_buffer.h"
 #include "config/env_report.h"
+#include "config/paths.h"
 #include "engine/engine.h"
 #include "engine/engine_internal.h"
 #include "engine/thread_policy.h"
 #include "mem/accountant.h"
-#include "models/profile.h"
 #include "plan/residency.h"
 #include "tools/repack.h"
 
@@ -29,7 +32,6 @@ namespace dray::engine {
 
 namespace {
 
-constexpr int32_t kPrefillBatchDefault = 512;
 
 bool env_is_one(const char* name) {
     const char* v = std::getenv(name);
@@ -85,18 +87,33 @@ std::unique_ptr<Engine> Engine::open(const EngineConfig& cfg, std::string* err) 
     //     elsewhere); the legacy envs remain censused alternatives.
     const bool gpu_consent = cfg.gpu || env_is_one("DRAY_VULKAN") || env_is_one("DRAY_METAL");
 
+    // --- settings: every tuning value, resolved once per model (config/).
+    config::Settings settings;
+    {
+        config::CliSettings cli;
+        cli.threads = cfg.n_threads;
+        cli.prefill_chunk = cfg.prefill_chunk;
+        cli.vram_cap = cfg.vram_cap;
+        const std::string gguf = std::filesystem::path(cfg.model_path).filename().string();
+        std::string serr;
+        if (!config::resolve(config::default_locations(cfg.config_dir), p.arch, gguf, cli,
+                             &settings, &serr)) {
+            return fail("settings: " + serr);
+        }
+        if (settings.applied.empty()) {
+            std::fprintf(stderr, "settings: built-in values only (no config files found)\n");
+        } else {
+            for (const std::string& f : settings.applied) std::fprintf(stderr, "settings: %s\n", f.c_str());
+        }
+    }
+
     // --- prefill chunk. MEASURED (2026-08-23, 6594-token prompt on the 27B):
     //     chunk size matters far more on GPU than CPU, because a larger physical
     //     batch amortises the PCIe weight transfer -- GPU 43s at 512 vs 23s at
-    //     2048, CPU 47m23s vs 44m03s. --prefill-chunk overrides; small-VRAM cards
-    //     need it (1.3 GiB at chunk 64, measured).
-    int32_t chunk = gpu_consent ? 2048 : kPrefillBatchDefault;
-    if (cfg.prefill_chunk > 0) {
-        if (cfg.prefill_chunk < 16 || cfg.prefill_chunk > 8192) {
-            return fail("--prefill-chunk must be 16..8192");
-        }
-        chunk = cfg.prefill_chunk;
-    }
+    //     2048, CPU 47m23s vs 44m03s. Small-VRAM cards need a small one (1.3 GiB
+    //     at chunk 64, measured): prefill.chunk_{cpu,gpu}, or --prefill-chunk.
+    const int32_t chunk = gpu_consent ? settings.prefill_chunk_gpu.value
+                                      : settings.prefill_chunk_cpu.value;
 
     llama_backend_init();
 
@@ -117,6 +134,7 @@ std::unique_ptr<Engine> Engine::open(const EngineConfig& cfg, std::string* err) 
     e->cap_ = cfg.cap;
     e->model_id_ = cfg.model_path.substr(cfg.model_path.find_last_of("/\\") + 1);
     e->prefill_batch_ = chunk;
+    e->settings_ = std::move(settings);
     e->load_ = std::make_unique<LoadState>();
 
     std::string step_err;
@@ -126,6 +144,7 @@ std::unique_ptr<Engine> Engine::open(const EngineConfig& cfg, std::string* err) 
         !e->verify_floor(&step_err) ||
         !e->check_storage_backend(&step_err) ||
         !e->create_context(cfg, gpu_consent, &step_err) ||
+        !e->reserve_gpu_copy_pool(gpu_consent, &step_err) ||
         !e->reserve_checkpoint_allowance(cfg, &step_err) ||
         !e->admit(cfg, &step_err)) {
         return fail(step_err);   // e's destructor releases what was acquired
@@ -158,7 +177,8 @@ bool Engine::reserve_floor(std::string* err) {
 bool Engine::start_streamer(const EngineConfig& cfg, bool gpu_consent, std::string* err) {
     backend::Config scfg;
     scfg.cap = cfg.cap;
-    scfg.queue_depth = 64;
+    scfg.queue_depth = static_cast<uint32_t>(settings_.queue_depth.value);
+    scfg.admit_byte_fraction = settings_.admit_byte_fraction.value;
     scfg.slow_load = env_is_one("DRAY_SLOW_LOAD");
     scfg.no_compact = env_is_one("DRAY_NO_COMPACT");
     scfg.n_seq = sequences(cfg);   // churn reserve scales with the union working set
@@ -220,6 +240,10 @@ bool Engine::load_model(const EngineConfig& cfg, bool gpu_consent, std::string* 
         // Account the weights we are about to hand off, so the cap keeps
         // meaning what it says even though llama does the allocating.
         acct_->reserve(mem::Category::ExpertCache, model_bytes);
+        // Gate lever: resident WITHOUT the repacked kernels computes exactly what
+        // the streaming path computes (same kernels on every device), so it is a
+        // bit-exact reference for how weights arrive -- scripts/gpugate.ps1.
+        if (env_is_one("DRAY_NO_REPACK")) mp.use_extra_bufts = false;
         std::fprintf(stderr,
                      "resident mode: the whole model (%.2f GB) fits the cache budget, so "
                      "llama allocates it natively and reaches its repacked-weight kernels "
@@ -243,12 +267,12 @@ bool Engine::load_model(const EngineConfig& cfg, bool gpu_consent, std::string* 
         mp.devices = devs.data();
     }
 
-    const models::Profile* prof = models::find_profile(plan_->arch);
-    if (!build_kv_overrides(cfg.kv_overrides, prof, &load_->kv_overrides, err)) return false;
+    const std::vector<std::string>& model_kv = settings_.kv_defaults.value;
+    if (!build_kv_overrides(cfg.kv_overrides, model_kv, &load_->kv_overrides, err)) return false;
     if (!load_->kv_overrides.entries.empty()) {
         for (const auto& o : load_->kv_overrides.entries) {
             std::fprintf(stderr, "kv-override: %s (%s)\n", o.key,
-                         prof && prof->kv_defaults ? "profile default or CLI" : "CLI");
+                         model_kv.empty() ? "CLI" : "model config or CLI");
         }
         mp.kv_overrides = load_->kv_overrides.terminated();
     }
@@ -343,13 +367,14 @@ bool Engine::create_context(const EngineConfig& cfg, bool gpu_consent, std::stri
     cp.n_ubatch = prefill_batch_;
 
     const ThreadChoice th = choose_threads(
-        cfg.n_threads, static_cast<int>(std::thread::hardware_concurrency()));
+        settings_.decode_threads.value, settings_.prefill_threads.value,
+        settings_.reserved_threads.value, static_cast<int>(std::thread::hardware_concurrency()));
     if (th.clamped) {
         std::fprintf(stderr,
                      "compute threads: %d requested, CLAMPED to %d -- this process runs "
                      "~%d threads of its own and ggml spin-waits, so exceeding %d cores "
                      "collapses throughput (measured 20x+).\n",
-                     th.requested, th.ceiling, kOwnThreads,
+                     th.requested, th.ceiling, settings_.reserved_threads.value,
                      static_cast<int>(std::thread::hardware_concurrency()));
     }
     cp.n_threads = th.decode;
@@ -380,8 +405,18 @@ bool Engine::create_context(const EngineConfig& cfg, bool gpu_consent, std::stri
     }
     cp.abort_callback = &backend::Streamer::abort_cb;
     cp.abort_callback_data = streamer_.get();
-    lctx_ = llama_init_from_model(model_, cp);
-    if (!lctx_) { *err = "failed to create context"; return false; }
+    if (!gpu_consent) {
+        lctx_ = llama_init_from_model(model_, cp);
+        if (!lctx_) { *err = "failed to create context"; return false; }
+    } else if (!create_gpu_context(&cp, err)) {
+        return false;
+    }
+    attach_threadpools(static_cast<int>(cp.n_threads), static_cast<int>(cp.n_threads_batch));
+    // GPU splits (--gpu prefill) copy their weight inputs straight from host memory
+    // before any eval callback runs: without this, a streamed weight not yet
+    // materialised was copied as poison -- garbage text, no failure counted
+    // (2026-09-30). Resident mode: llama owns the weights, nothing to do.
+    if (!resident_mode_) llama_set_copy_callback(lctx_, &backend::Streamer::copy_cb, streamer_.get());
     return true;
 }
 
@@ -453,6 +488,157 @@ bool Engine::admit(const EngineConfig& cfg, std::string* err) {
         return false;
     }
     return true;
+}
+
+}  // namespace dray::engine
+
+namespace dray::engine {
+
+namespace {
+
+// The first GPU device ggml knows (the one --gpu computes on), with its VRAM.
+bool gpu_vram(uint64_t* total, std::string* name) {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_dev_memory(d, &free_b, &total_b);
+        *total = total_b;
+        *name = ggml_backend_dev_description(d);
+        return total_b > 0;
+    }
+    return false;
+}
+
+// What the context holds outside host memory: every non-host buffer type.
+uint64_t device_bytes(const llama_context* ctx) {
+    uint64_t sum = 0;
+    for (const auto& [buft, mb] : llama_get_memory_breakdown(ctx)) {
+        if (buft && !ggml_backend_buft_is_host(buft)) sum += mb.total();
+    }
+    return sum;
+}
+
+double gib(uint64_t b) { return b / 1073741824.0; }
+
+}  // namespace
+
+bool Engine::create_gpu_context(llama_context_params* cp, std::string* err) {
+    uint64_t vram = 0;
+    std::string dev;
+    if (!gpu_vram(&vram, &dev)) {
+        *err = "--gpu: no GPU device with a known amount of VRAM";
+        return false;
+    }
+    // The HARD limit: configured in bytes, or a part of the card (the owner's
+    // rule: this engine borrows a slice of the machine, it does not take it).
+    const bool automatic = settings_.gpu_vram_cap.value == 0;
+    const double frac = vram <= settings_.gpu_vram_small_card.value
+                            ? settings_.gpu_vram_auto_fraction_small.value
+                            : settings_.gpu_vram_auto_fraction.value;
+    const uint64_t cap = automatic ? static_cast<uint64_t>(static_cast<double>(vram) * frac)
+                                   : settings_.gpu_vram_cap.value;
+
+    // Largest prefill chunk whose context fits: the compute buffer (and the
+    // scheduler's copies of weights) grows with it. Halved until it fits; a
+    // context that cannot even be allocated counts as not fitting. At each
+    // chunk, first as is, then with kv_home: the work that scales with the KV
+    // cache (attention and indexer scores over every cached key) kept on the
+    // CPU beside the cache. That bounds VRAM by the chunk instead of the
+    // context, but costs time where the cache is small (Flash Next, 8k context:
+    // 219/214 s without, 278/264 s with), so it is used only when it is what
+    // lets this chunk fit (2 x 600k context in 1.94 GiB: chunk 32 -> 512).
+    uint64_t smallest_seen = 0;
+    for (uint32_t chunk = cp->n_ubatch; chunk >= 16; chunk /= 2) {
+        cp->n_batch = chunk;
+        cp->n_ubatch = chunk;
+        for (const bool kv_home : { false, true }) {
+            cp->kv_home = kv_home;
+            llama_context* ctx = llama_init_from_model(model_, *cp);
+            if (!ctx) continue;   // the device refused the allocation
+            const uint64_t used = device_bytes(ctx);
+            if (used <= cap) {
+                lctx_ = ctx;
+                prefill_batch_ = static_cast<int32_t>(chunk);
+                std::fprintf(stderr,
+                             "gpu: %s, %.2f GiB VRAM; limit %.2f GiB (%s); using %.2f GiB at prefill "
+                             "chunk %u%s\n",
+                             dev.c_str(), gib(vram), gib(cap),
+                             automatic ? (std::to_string(static_cast<int>(frac * 100 + 0.5)) +
+                                          "% of the card, gpu.vram_cap unset").c_str()
+                                       : "gpu.vram_cap / --vram-cap",
+                             gib(used), chunk,
+                             kv_home ? ", context-sized work kept on the CPU with the KV cache" : "");
+                return true;
+            }
+            smallest_seen = used;
+            llama_free(ctx);
+        }
+    }
+    *err = "--gpu: REFUSED: " +
+           (smallest_seen ? "the smallest prefill chunk (16) still needs " +
+                                std::to_string(gib(smallest_seen)).substr(0, 5) + " GiB of VRAM"
+                          : std::string("no prefill chunk could be allocated on the GPU")) +
+           "; the limit is " + std::to_string(gib(cap)).substr(0, 5) + " GiB (" +
+           (automatic ? "automatic; set gpu.vram_cap or --vram-cap to change it" : "gpu.vram_cap / --vram-cap") +
+           "). Raise the limit, or run without --gpu.";
+    return false;
+}
+
+}  // namespace dray::engine
+
+namespace dray::engine {
+
+// --gpu without the routed experts cached whole: each GPU split's copy reads its
+// routed experts into a landing region. Landed in memory the GPU backend can DMA
+// from directly, the copy skips the backend's staging memcpy and its implicit
+// drain -- 35B-A3B, 2.3k-token prompt: copy until done 33.1/30.9 s -> 13.0/12.0 s,
+// reads 26 -> 16.4 s, same bytes and text. One slot per expert kind (gate / up /
+// down), each the size of that kind's largest tensor: while one is copied, the
+// layer's other two are read ahead into theirs (Streamer::gpu_copy_pool_wanted).
+bool Engine::reserve_gpu_copy_pool(bool gpu_consent, std::string* err) {
+    if (!gpu_consent || resident_mode_ || !streamer_) return true;
+    const uint64_t want = streamer_->gpu_copy_pool_wanted();
+    if (want == 0) return true;
+    if (!acct_->reserve(mem::Category::IoStaging, want)) {
+        *err = "REFUSED: --gpu needs " + std::to_string(want >> 20) +
+               " MiB of pinned copy memory on top of the floor; raise --cap or run without --gpu";
+        return false;
+    }
+    if (!streamer_->set_gpu_copy_pool(want)) {
+        acct_->release(mem::Category::IoStaging, want);
+        std::fprintf(stderr, "gpu: no pinned copy memory from the GPU backend; copies land in "
+                             "ordinary memory (slower)\n");
+        return true;
+    }
+    std::fprintf(stderr, "gpu: %llu MiB pinned copy memory reserved inside the cap\n",
+                 static_cast<unsigned long long>(want >> 20));
+    return true;
+}
+
+}  // namespace dray::engine
+
+namespace dray::engine {
+
+// Persistent CPU thread pools, as stock llama.cpp's tools attach them. Without one
+// ggml_graph_compute builds a disposable pool per call (creating and joining
+// n_threads-1 OS threads), and the streamer makes one call per claimed node. NOTE:
+// measured, this did NOT change decode speed (35B: 0.31/0.52/0.78 s/token at 1/2/4
+// threads either way, polling level irrelevant) -- the per-node cost of threaded
+// execution lies elsewhere (DECISIONS 2026-10-01); kept because it is the stock shape.
+void Engine::attach_threadpools(int n_decode, int n_prefill) {
+    if (!lctx_ || n_decode <= 0) return;
+    ggml_threadpool_params pd = ggml_threadpool_params_default(n_decode);
+    tp_decode_ = ggml_threadpool_new(&pd);
+    if (n_prefill > 0 && n_prefill != n_decode) {
+        ggml_threadpool_params pp = ggml_threadpool_params_default(n_prefill);
+        tp_prefill_ = ggml_threadpool_new(&pp);
+    } else {
+        tp_prefill_ = tp_decode_;
+    }
+    if (tp_decode_ && tp_prefill_) {
+        llama_attach_threadpool(lctx_, tp_decode_, tp_prefill_);
+    }
 }
 
 }  // namespace dray::engine

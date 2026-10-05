@@ -38,13 +38,14 @@ struct Args {
     bool resident = false;                  // --resident: EXPERIMENTAL llama-native allocation when it fits
     std::string out_dir;         // repack: output directory
     std::string repack_dir;      // every engine command: apply a repacked companion
+    std::string config_dir;      // --config-dir: the user settings directory (config/paths.h)
+    uint64_t    vram_cap = 0;    // --vram-cap: the hard VRAM limit for --gpu (gpu.vram_cap)
+    int32_t     parallel = 0;    // --parallel: serve.max_parallel (requests generating at once)
     std::string jobs_dir;        // serve: checkpoint+resume dir (empty = off)
     std::string api_key;         // serve: bearer token for /v1/* (empty = open, localhost-only)
     bool     help = false;
 };
 
-// Cap parsing accepts a plain byte count or a K/M/G/T suffix; bare G means GiB.
-uint64_t parse_size(const std::string& s, bool* ok);
 bool parse_args(int argc, char** argv, Args* a);
 void usage();
 

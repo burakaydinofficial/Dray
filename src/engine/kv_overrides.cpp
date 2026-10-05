@@ -3,7 +3,6 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "models/profile.h"
 
 namespace dray::engine {
 
@@ -61,7 +60,7 @@ const llama_model_kv_override* KvOverrides::terminated() {
 }
 
 bool build_kv_overrides(const std::vector<std::string>& cli,
-                        const models::Profile* profile,
+                        const std::vector<std::string>& model_defaults,
                         KvOverrides* out, std::string* error) {
     for (const std::string& s : cli) {
         if (!parse_one(s, &out->entries)) {
@@ -69,12 +68,10 @@ bool build_kv_overrides(const std::vector<std::string>& cli,
             return false;
         }
     }
-    if (profile && profile->kv_defaults) {
-        for (const char* const* d = profile->kv_defaults; *d; ++d) {
-            if (!parse_one(*d, &out->entries)) {
-                *error = std::string("bad profile kv_default \"") + *d + "\"";
-                return false;
-            }
+    for (const std::string& d : model_defaults) {
+        if (!parse_one(d, &out->entries)) {
+            *error = "bad model config kv_default \"" + d + "\"";
+            return false;
         }
     }
     return true;

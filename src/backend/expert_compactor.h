@@ -80,10 +80,39 @@ public:
     uint64_t early_unlocks() const { return early_unlocks_; }
     // IO_STATS: time inside Phase C and in region room/allocation.
     void append_timing(std::ostream& o) const;
+    // The expert union the churn reserve was sized for (StreamBudget); 0 = only
+    // pure decode steps take the fast paths.
+    void set_funded_union(uint64_t n) { funded_union_ = n; }
 
     // Teardown: every pending region's DMA must complete before its memory may
     // be freed; a region whose backend died is leaked, loudly.
     void release_all();
+
+    // For a GPU split's copy of an expert-fused weight: a full-size region with
+    // ONLY `experts` present, each at its own index (the copy reads exactly
+    // those), read in one deep batch, frequency-cache hits copied from RAM.
+    // Never cached -- the rest of the region is garbage. Returns the data
+    // pointer, or null; *mem and *bytes are what to free.
+    // With copy slots set (set_copy_slots), it lands in the slot of w's expert
+    // kind instead -- memory the GPU backend DMAs from directly -- and *bytes is 0
+    // (nothing to free); a matching prefetch there is waited for, not re-read.
+    uint8_t* read_experts_for_copy(ggml_tensor* w, const int32_t* experts, int64_t n,
+                                   uint8_t** mem, uint64_t* bytes, uint64_t* streamed);
+
+    // GPU copy landing slots, one per expert kind (gate / up / down): pinned memory
+    // owned by the caller, which must call settle_copy_slots() before freeing it.
+    // A layer's three expert tensors use the SAME expert ids and are copied in
+    // consecutive splits, so when one is copied the other two kinds' experts are
+    // read ahead into their slots (prefetch_copy_siblings), overlapping the disk
+    // with the copy and the GPU work in between.
+    static constexpr int kCopyKinds = 3;
+    static int copy_kind(const ggml_tensor* w);   // 0 gate (also fused/other), 1 up, 2 down
+    static int copy_kind_of(const char* tensor_name);
+    void set_copy_slots(uint8_t* const base[kCopyKinds], const uint64_t bytes[kCopyKinds]);
+    void prefetch_copy_siblings(ggml_tensor* w, const int32_t* experts, int64_t n, uint64_t* streamed);
+    void settle_copy_slots();
+    uint64_t copy_prefetch_hits() const { return copy_prefetch_hits_; }
+    uint64_t copy_prefetch_misses() const { return copy_prefetch_misses_; }
 
 private:
     // A sibling region from submission until its own node adopts it. NOT in the
@@ -104,8 +133,25 @@ private:
         int64_t      n_expert = 0;
     };
 
-    bool is_decode(const ggml_tensor* ids) const {
+    // The decode paths (sibling prefetch, early unlock, routing statistics) for
+    // a step: a pure decode step (at most the funded width of tokens), or one
+    // whose union of experts is no larger than the union the churn reserve
+    // funded (StreamBudget: expected union at the funded width, k for one
+    // stream). Per layer the slot size is fixed, so that IS a byte bound: a
+    // prompt chunk riding along with decode tokens (continuous batching) keeps
+    // the fast paths while its region fits the reserve, and falls back to the
+    // safe path the moment it would not.
+    // The frequency cache admits only on DECODE-width steps (at most the funded
+    // width of tokens). Prefill -- and a prompt chunk riding along with decode
+    // tokens -- never admits: its allocations would compete with the static
+    // pinning claim that has not settled (GLM 16 GiB: slots admitted at prefill
+    // packed the budget, the region had no room). One rule for both paths.
+    bool admits(const ggml_tensor* ids) const {
         return ids->ne[1] <= static_cast<int64_t>(decode_width_);
+    }
+    bool fast_path(const ggml_tensor* ids, size_t n_uniq) const {
+        if (ids->ne[1] <= static_cast<int64_t>(decode_width_)) return true;
+        return funded_union_ > 0 && n_uniq <= funded_union_;
     }
     void submit_sibling_region(ggml_tensor* w, const std::vector<int32_t>& uniq);
     void submit_layer_siblings(ggml_tensor* w, const std::vector<int32_t>& uniq);
@@ -115,14 +161,36 @@ private:
     // alignment, which every expert shares when the on-disk stride is a multiple
     // of it (K3, GLM: all of them). Otherwise head is 0 and reads are staged, as
     // before. Evicts through make_room. False = no room.
+    // `spare`: the tensor's own previous region, reclaimed for this replacement
+    // (ResidencyCache::reclaim_own with region_geom's bytes and align) -- used
+    // as is, with no eviction and no allocation.
     bool alloc_region(const Source& src, uint64_t stride, uint64_t need,
-                      uint8_t** mem, uint64_t* bytes, uint32_t* head);
+                      uint8_t** mem, uint64_t* bytes, uint32_t* head, void* spare = nullptr);
+    // Size and placement a region of `need` bytes gets for `src`: the one rule
+    // alloc_region and reclaim_own must agree on.
+    struct RegionGeom { uint64_t bytes = 0; uint32_t head = 0; uint32_t align = 0; };
+    RegionGeom region_geom(const Source& src, uint64_t stride, uint64_t need) const;
 
     Parts                        p_;
     const StreamFlags&           flags_;
     const uint32_t               decode_width_;
+    uint64_t                     funded_union_ = 0;   // set_funded_union
     const std::atomic<uint64_t>& failures_;
     std::unordered_map<const ggml_tensor*, PendingRegion> pending_;
+    struct CopySlot {
+        uint8_t*              mem = nullptr;   // the pinned slot (caller-owned)
+        uint64_t              bytes = 0;
+        bool                  pending = false; // reads in flight into it (tags)
+        const ggml_tensor*    w = nullptr;     // what they are for
+        std::vector<int32_t>  experts;
+        uint8_t*              data = nullptr;
+        std::vector<uint64_t> tags;
+    };
+    CopySlot copy_slots_[kCopyKinds];
+    uint64_t copy_prefetch_hits_ = 0, copy_prefetch_misses_ = 0;
+    // Waits for a slot's reads; false if any failed. A dead backend leaves the slot
+    // unusable (its memory is still a DMA target), loudly.
+    bool settle_slot(CopySlot& s);
     std::unordered_map<const ggml_tensor*, ExpertTrio>    trio_by_ids_;
     uint64_t early_unlocks_ = 0;
     uint64_t ns_unlock_ = 0, ns_room_ = 0, ns_alloc_ = 0;

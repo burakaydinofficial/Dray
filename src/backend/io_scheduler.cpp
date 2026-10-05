@@ -1,5 +1,6 @@
 #include "backend/io_scheduler.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -314,6 +315,9 @@ uint64_t IoScheduler::submit_staged(const Source& s, void* dst, uint64_t bytes) 
     const uint64_t head = s.offset - lo;
     uint64_t span = head + bytes;
     span = ((span + al.length - 1) / al.length) * al.length;
+    // A request's length is 32 bits. Staged reads are expert slices and table
+    // rows (megabytes); anything bigger is refused, never silently truncated.
+    if (span > UINT32_MAX) return 0;
 
     // Staging counts against the cap like anything else -- it was never accounted,
     // and with a deep queue it is not small. But unlike cache, staging is TRANSIENT
@@ -548,15 +552,27 @@ void* IoScheduler::read_whole(mem::Category cat, const Source& s, uint64_t bytes
 
     // Queued like any other urgent read: a full device queue delays it, never
     // refuses it. A read the backend genuinely refuses completes as failed.
-    const uint64_t tag = submit_unstaged(f, lo, static_cast<uint32_t>(span), base, head, bytes);
-    const std::vector<uint64_t> one{tag};
-    bool ok = false;
+    //
+    // In chunks of at most 1 GiB. A request's length is 32 bits, and one
+    // request for the whole span truncated anything over 4 GiB: a 28.8 GB
+    // engram table was asked for as 3.03 GB and failed short (caught, but it
+    // could never succeed). Chunk k must deliver its whole length unless it
+    // runs past the tensor's end, where the file may legally end early.
+    const uint64_t kChunk = whole_chunk_;
+    std::vector<uint64_t> tags;
+    for (uint64_t off = 0; off < span; off += kChunk) {
+        const uint64_t len = std::min(kChunk, span - off);
+        const uint64_t end = head + bytes;
+        const uint64_t need = off >= end ? 0 : std::min(len, end - off);
+        tags.push_back(submit_unstaged(f, lo + off, static_cast<uint32_t>(len), base + off, 0, need));
+    }
+    bool ok = true;
     uint64_t got = 0;
     int status = 0;
-    bool found = false;
+    bool found = true;
     {
         Lock lk(m_);
-        if (!wait_all(lk, one)) {
+        if (!wait_all(lk, tags)) {
             // Pass-4b: a dead backend here means the read may STILL be writing into
             // `base` -- fabricating done/ok and freeing below was the third
             // free-under-DMA site of the F2 class (the first two were fixed, this
@@ -564,13 +580,19 @@ void* IoScheduler::read_whole(mem::Category cat, const Source& s, uint64_t bytes
             std::fprintf(stderr,
                          "[dray] FATAL: backend dead with a direct read outstanding; "
                          "leaking its staging (no-cancel contract)\n");
-            pending_.erase(tag);
+            for (uint64_t t : tags) pending_.erase(t);
             return nullptr;
         }
-        auto it = pending_.find(tag);
-        found = it != pending_.end();
-        if (found) { ok = it->second.ok; got = it->second.got; status = it->second.status; }
-        pending_.erase(tag);
+        for (uint64_t t : tags) {
+            auto it = pending_.find(t);
+            if (it == pending_.end()) { ok = false; found = false; continue; }
+            if (!it->second.ok && ok) {   // report the first failing chunk
+                ok = false;
+                got = it->second.got;
+                status = it->second.status;
+            }
+            pending_.erase(it);
+        }
     }
     if (!ok && failures_ < 8) {
         // Name the reason. "read failed" without the numbers has cost hours on this
@@ -578,10 +600,10 @@ void* IoScheduler::read_whole(mem::Category cat, const Source& s, uint64_t bytes
         // a glance.
         std::fprintf(stderr,
             "[dray] DIRECT READ FAIL shard=%d off=%llu lo=%llu head=%llu bytes=%llu "
-            "span=%u got=%lld status=%d\n",
+            "span=%llu chunks=%zu first failing chunk got=%lld status=%d\n",
             s.shard, (unsigned long long)s.offset, (unsigned long long)lo,
-            (unsigned long long)head, (unsigned long long)bytes, (unsigned)span,
-            found ? (long long)got : -1LL, found ? status : -1);
+            (unsigned long long)head, (unsigned long long)bytes, (unsigned long long)span,
+            tags.size(), found ? (long long)got : -1LL, found ? status : -1);
         std::fflush(stderr);
     }
     if (!ok) { mem_.free(cat, base, span); return nullptr; }

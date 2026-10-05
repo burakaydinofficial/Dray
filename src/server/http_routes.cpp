@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <ctime>
 #include <memory>
+#include <future>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -13,6 +14,8 @@
 
 #include "cache/snapshot_cache.h"
 #include "engine/engine.h"
+#include "engine/scheduler.h"
+#include "engine/ram_kv_store.h"
 #include "server/http_routes.h"
 #include "server/job_registry.h"
 #include "server/job_store.h"
@@ -35,42 +38,56 @@ void not_found(httplib::Response& res) {
 
 void install_status_routes(httplib::Server& srv, const ServerContext& ctx) {
     Engine* eng = ctx.engine;
-    auto gate = ctx.gate;
-
+    auto sched = ctx.sched;
+    const engine::RamKvStore* kv = ctx.kv;
 
     // Swarm S4: engine_report() walks the streamer's live containers, which the
     // decode thread mutates; calling it concurrently is a use-after-free waiting
-    // on a deque block boundary. /health therefore only reads the streamer when
-    // it can take the admission gate (nothing generating); otherwise it serves
-    // the last idle snapshot and says so. Taint and identity are safe always
-    // (atomic counter, immutable string).
-    auto health_cache = std::make_shared<std::pair<std::mutex, std::string>>();
-    srv.Get("/health", [eng, gate, health_cache](const httplib::Request&, httplib::Response& res) {
+    // on a deque block boundary. /health therefore reads the streamer only ON
+    // the scheduler's thread, between two steps (Scheduler::post). A step can
+    // take seconds on a flagship, so /health waits briefly and otherwise serves
+    // the last snapshot and says so. Taint and identity are safe always (atomic
+    // counter, immutable string).
+    struct Snapshot {
         std::string report;
-        bool live = false;
-        EngineCounters hc;
-        {
-            std::unique_lock<std::mutex> g(*gate, std::try_to_lock);
-            if (g.owns_lock()) {
-                report = eng->streamer_report();
-                live = true;
-                // T12: counters must be read HERE, while the gate is genuinely
-                // held -- the old code read them after this scope closed, under
-                // a comment claiming otherwise.
-                hc = eng->counters();
-                std::lock_guard<std::mutex> ck(health_cache->first);
-                health_cache->second = report;
-            }
-        }
-        if (!live) {
+        EngineCounters counters;
+        engine::RamKvStore::Stats kv;
+    };
+    auto health_cache = std::make_shared<std::pair<std::mutex, Snapshot>>();
+    srv.Get("/health", [eng, sched, kv, health_cache](const httplib::Request&, httplib::Response& res) {
+        auto fresh = std::make_shared<Snapshot>();
+        std::future<void> f = sched->post([eng, kv, fresh, health_cache] {
+            // T12: report and counters read together, at the same boundary.
+            fresh->report = eng->streamer_report();
+            fresh->counters = eng->counters();
+            if (kv) fresh->kv = kv->stats();
             std::lock_guard<std::mutex> ck(health_cache->first);
-            report = health_cache->second.empty()
-                         ? "generation in progress; no idle snapshot yet"
-                         : health_cache->second;
+            health_cache->second = *fresh;
+        });
+        const bool live = f.wait_for(std::chrono::milliseconds(250)) == std::future_status::ready;
+        Snapshot shown;
+        if (live) {
+            shown = *fresh;
+        } else {
+            std::lock_guard<std::mutex> ck(health_cache->first);
+            shown = health_cache->second;
+            if (shown.report.empty()) shown.report = "a step is in progress; no snapshot yet";
         }
+        const engine::Scheduler::Stats st = sched->stats();
+        const std::string& report = shown.report;
+        const EngineCounters& hc = shown.counters;
         json j = {
             { "status", eng->tainted() ? "tainted" : "ok" },
-            { "busy", !live },
+            { "busy", st.active > 0 },
+            { "requests", { { "active", st.active }, { "waiting", st.waiting } } },
+            // Conversation reuse: prompts that continued a kept conversation and
+            // the prompt tokens they did not prefill again.
+            { "kv_reuse", { { "requests", st.reused_requests }, { "tokens", st.reused_tokens } } },
+            // Conversations parked outside the slots (read with the report, at a
+            // step boundary; the last snapshot while a step runs).
+            { "kv_pool", { { "entries", shown.kv.pool_entries }, { "tokens", shown.kv.pool_tokens },
+                           { "bytes", shown.kv.pool_bytes }, { "parked", shown.kv.parked },
+                           { "restored", shown.kv.restored }, { "evicted", shown.kv.pool_evicted } } },
             // T13: lock-free live fields, valid even mid-generation -- a cap
             // breach hours into a job is visible NOW, not at its end.
             { "generation", { { "tokens", eng->live_tokens() },
@@ -80,7 +97,7 @@ void install_status_routes(httplib::Server& srv, const ServerContext& ctx) {
             { "report_is_live", live },
         };
         if (live) {
-            // R7/S37: structured counters, captured above under the gate.
+            // R7/S37: structured counters, read with the report at one step boundary.
             j["counters"] = {
                 { "bytes_streamed", hc.bytes_streamed },
                 { "bytes_gather", hc.bytes_gather },
@@ -100,7 +117,8 @@ void install_status_routes(httplib::Server& srv, const ServerContext& ctx) {
                           { "object", "model" },
                           { "owned_by", "dray" },
                           { "created", static_cast<int64_t>(std::time(nullptr)) },
-                          { "context_length", llama_n_ctx(eng->context()) } } } },
+                          // Per request: each slot has its own context (n_ctx is the sum).
+                          { "context_length", llama_n_ctx_seq(eng->context()) } } } },
         };
         res.set_content(j.dump(2), "application/json");
     });

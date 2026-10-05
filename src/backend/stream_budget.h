@@ -33,6 +33,11 @@ struct StreamBudget {
     // measured floor. Certain death below 1x (B=38), proven clean at 2x (B=32).
     uint64_t batch_region_bound = 0;
 
+    // The expert union the churn reserve funds per layer (expected union at the
+    // funded width; k for one stream). Steps whose union fits it may take the
+    // decode fast paths (ExpertCompactor::fast_path).
+    uint64_t funded_union = 0;
+
     // Phase B ring arena to allocate, already aligned. 0 = no ring.
     uint64_t ring_target = 0;
 

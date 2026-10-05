@@ -36,9 +36,11 @@ bytes per token, not parameter count. Qwen3.6 35B-A3B costs 287 MiB/token at
 GB. Kimi K3 costs 54.5 GB/token for scale. All three sparse models run correct
 text on a THREE GiB cap. Batched at width 32 with varied prompts: 35B-A3B 0.213
 GB/token (0 bytes at 28 GiB, fully resident), 122B-A10B 0.406, DeepSeek 0.892.
-The 122B clears width 96 on 28 GiB. Prefill: a 6,594-token prompt takes 22
-seconds with --gpu against 47 minutes on CPU. Resident mode (opt-out, when the
-model fits the cap) reaches parity with stock llama.cpp; --force-stream pins the
+The 122B clears width 96 on 28 GiB. The --gpu prefill figures of 2026-08
+(22 seconds for a 6,594-token prompt, 12-72x) are WITHDRAWN: streamed --gpu
+computed on poison until 2026-09-30 (DECISIONS; gated by gpugate). Resident mode (opt-out, when the
+model fits the cap) is correct but 21-46% SLOWER than stock llama.cpp (measured
+2026-08-24) -- if a model fits, use llama.cpp. --force-stream pins the
 streaming path and every gate uses it.
 
 Correctness is sealed on Windows/Linux/macOS at identical node counts; the
@@ -51,12 +53,12 @@ left to share once a token costs under a gigabyte; read the absolute column.
 Over-width runs refuse AT LOAD with the required cap priced. Width is bound by
 per-sequence state (KV + recurrent), not the weight cache -- which is why the
 122B reaches width 96 (176 MiB per sequence) where K3 stops at 44 (~1 GB). Cohort rotation (`--rotate`, opt-in, write-honest,
-`--state-dir` explicit) serves deeper queues; mid-generation parking is guarded off —
-the fork's llama_state_seq restore is measurably nondeterministic (minimal repro in
-DECISIONS). The original build-order paragraph is preserved in git history; its
+`--state-dir` explicit) serves deeper queues; mid-generation parking is still guarded
+off until gated, though the 08-19 restore nondeterminism no longer reproduces: park/restore
+is bit-exact on both bases, attention and recurrent (2026-09-29, DECISIONS). The original build-order paragraph is preserved in git history; its
 M3-first plan was overtaken by events — K3 support arrived via an upstream community PR
 carried in the vendored fork, and GLM-5.2 joined as the small flagship. MiniMax M3 is
-measured (2026-08-20: correct text at 8 GiB, 4.61 GiB/token — the profile kv_defaults
+measured (2026-08-20: correct text at 8 GiB, 4.61 GiB/token — the model config kv_defaults
 mechanism supplies five indexer keys the released conversion lacks); Qwen3.8's q1-dtype
 branch reconversion remains open.
 
@@ -94,6 +96,11 @@ scripts/clonegate.ps1    # DOES THIS BUILD FOR A STRANGER -- before any push
 scripts/golden.ps1       # DID A REFACTOR CHANGE ANYTHING -- 25 cases (every
 scripts/serve-smoke.ps1  # command + every streamer lever), and every server
                          # route incl. crash-resume; record before, compare after
+scripts/serve-parallel.ps1 # 8 clients on 4 slots: all answer; each vs its serial answer
+scripts/serve-reuse.ps1  # a 3-turn chat + an edited history vs a fresh server: reuse
+                         # (KV cut or recurrent checkpoint) answers what a fresh one does
+scripts/gpugate.ps1      # --gpu (a Vulkan build): streaming BIT-IDENTICAL to llama's own
+                         # GPU path; before anything touching --gpu, the fork or weight delivery
 ```
 
 `archgate` is the newest and exists because the other three cannot catch what
@@ -149,13 +156,17 @@ wsl -d Ubuntu-22.04 -- env BIN=/home/you/dray-build/bin/dray bash /mnt/d/Project
    `RWF_DONTCACHE` instantiates folios and prunes them.) mmap is fine for the GGUF header and tensor table.
 3. **Never assume bits-per-weight, anywhere.** Slot sizes, coalescing widths and every byte figure come from
    the GGUF tensor table. This is what makes all quant tiers work with no per-quant code.
-4. **A model name appears only in the registry.** No branching on architecture identity anywhere else.
+4. **A model name appears only in its config file** (`config/models/<arch>.json`). No branching on architecture identity anywhere else.
 5. **Alignment, page size, sector size, block size and queue depth are discovered at runtime**, never
    hardcoded — the drive population is too varied for defaults.
 6. **The readout is measured, live, honest and durable.** Seconds per token by default; ETAs disclose the rate
    window they used; counters are integer or float64, never float32; anything unobtainable is reported
    *unknown*, never defaulted.
-7. **Admission is serialized by default.** Batching past ~8 dissolves the streaming premise.
+7. **Parallelism is funded, never improvised.** `serve` runs `serve.max_parallel` requests at once
+   (default 1), each in its own slot with its own KV, all funded at load inside the cap; past that they
+   queue. Every generation goes through `engine::Scheduler`, the only thread that touches the model.
+   (This replaced "admission is serialized": measured, parallel sequences share each step's weight
+   reads -- 64 on Qwen3.8-Flash-Next decode ~4 tok/s against ~1 for one.)
 8. **Policy results are not generalized across models** — gains are strongly model-dependent.
 
 ## Architecture
@@ -167,8 +178,7 @@ wsl -d Ubuntu-22.04 -- env BIN=/home/you/dray-build/bin/dray bash /mnt/d/Project
    memory cannot be expressed by repointing `tensor->data`. Per MUL_MAT_ID node, the streamer reads only the
    router-selected experts into ONE compact region at the tensor's own stride, and repoints the node at a
    PRIVATE remapped ids tensor (`0..k-1`); the shared router ids are never modified, so ADD_ID and scale
-   GET_ROWS still see real ids. This lives in `backend/expert_compactor.cpp` (`compact_experts`). The older
-   per-layer slot-arena design (`cache/expert_cache.*`) survives only behind the `stream` diagnostic.
+   GET_ROWS still see real ids. This lives in `backend/expert_compactor.cpp` (`compact_experts`).
 3. **Prefetch scheduler** — router output and speculation → coalesced ordered reads → queue sized by
    calibration. Prefill runs a different policy from decode.
 4. **Storage backend** — platform-specific uncached async reads behind one interface. Its submission and
@@ -194,17 +204,23 @@ src/cli/              args (the Args struct + parser), one file per command,
                       reference_read (independent uncached reads for diagnostics)
 src/engine/           Engine (open steps in engine_setup.cpp; generate in engine.cpp),
                       BatchGenerator, CohortRotator, StreamedText (stops + UTF-8),
-                      kv_overrides, thread_policy, engine_types.h (plain data)
+                      Scheduler (continuous batching; Slot, Stepper/LlamaStepper),
+                      KvStore/RamKvStore (conversation reuse: kept in slots, parked in
+                      a pool outside them), kv_overrides,
+                      thread_policy, engine_types.h (plain data)
 src/server/           serve_main (composition), RequestGuard, JobRegistry, JobStore
-                      (sidecars + checkpoints), JobWorker, chat_completions + http_routes,
-                      StopWatcher/shutdown, chat_prompt
+                      (sidecars + checkpoints), JobWorker, http_routes, StopWatcher/shutdown;
+                      /v1/chat/completions = chat_request (body -> params or a 400),
+                      chat_response (the OpenAI wire format), chat_completions (route +
+                      transport), chat_format (the model's Jinja template, tool calls and
+                      reasoning through llama.cpp's chat library, strings-only boundary)
 src/backend/          the Streamer. stream_buffer.h is the only public surface; streamer_impl.h
                       composes one owner per concern: AccountedAlloc (the only allocator),
                       PoisonBuffers, IoScheduler (every read, one tag registry), TensorRegistry,
                       ResidencyCache (LRU, static pinning, eviction), ExpertCompactor (+PrivateIds),
-                      ExpertSlots (+RoutingSkew), UncondRing (Phase B), HitRates, Repacker.
+                      ExpertSlots (+RoutingSkew), UncondRing (Phase B), HitRates.
                       StreamBudget/StreamFlags are the setup; stream_buffer_type.cpp the ggml glue
-src/plan/ mem/ io/ calib/ report/ cache/ models/ config/ tools/   leaf modules
+src/plan/ mem/ io/ calib/ report/ cache/ config/ tools/   leaf modules
 ```
 
 Only the engine touches the Streamer; the CLI and the server go through `engine::Engine`. The
@@ -218,18 +234,21 @@ new mixer class or routing scheme is code. The three targets need **two state cl
 and opaque fixed-size recurrent state (K3's KDA and Qwen3.8's Gated DeltaNet share it).
 
 ```
-src/models/registry.cpp     # the ONLY file that lists models — one line each
-src/models/profile.h
-src/models/minimax_m3.cpp   # the one profile that exists; qwen38/kimi_k3 run
-                            # today with NO entry (arch-blind planner) and get
-                            # one only if they ever need profile-expressed
-                            # behaviour. src/state/ is future work for sliced
-                            # recurrent checkpoints; whole-state snapshots
-                            # cover resume today.
+config/system.json              # machine settings + policy (shipped default; the user
+                                # overrides it per key in their own config dir)
+config/models/<arch>.json       # the ONLY place a model is named: what the GGUF
+                                # cannot tell us (kv_defaults) and any policy the
+                                # model must differ on ("overrides"), optionally per
+                                # GGUF file ("files"). minimax-m3.json is the one that
+                                # exists; every other model runs with NO file (the
+                                # planner is arch-blind) and gets one only if it needs it.
+src/config/settings.{h,cpp}     # the layers, strict parsing, the readout
 ```
 
-A new model reusing existing mixer classes is a profile entry and nothing else. If a model needs behaviour the
-profile cannot express, extend the schema or add a hook interface — never add a branch on the name.
+A new model reusing existing mixer classes needs, at most, a model config file. If a model needs behaviour the
+config cannot express, extend the schema or add a hook interface — never add a branch on the name. Tuning
+values are never constants in engine code: a machine property goes in the system config, a model property
+is declared in the model's file, and `dray config -m <model>` shows every effective value and its source.
 
 ## The cost model
 

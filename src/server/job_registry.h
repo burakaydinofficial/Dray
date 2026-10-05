@@ -1,6 +1,6 @@
 // The in-memory job registry: background requests return an id immediately and
-// a single worker drains them FIFO under the same admission gate as foreground
-// requests -- Invariant 7 does not care who asked. Text accumulates as tokens
+// the worker drains them FIFO into the scheduler, where they run alongside
+// foreground requests -- a slot does not care who asked. Text accumulates as tokens
 // land, so a poll mid-generation shows honest partial output.
 //
 // LOCKING. One mutex guards the registry AND every Job's fields. Methods named

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <system_error>
 #include <string>
 #include <vector>
 
@@ -41,6 +43,16 @@ RotateResult CohortRotator::run(const RotateParams& p) {
         return rr;
     }
     if (p.state_dir.empty()) { rr.error = "rotate: --state-dir is required (rotation writes; where is an explicit choice)"; return rr; }
+    // Created here, or refused here with the reason: a missing directory used to
+    // surface only as "state park failed" on every sequence, mid-run.
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(p.state_dir, ec);
+        if (ec || !std::filesystem::is_directory(p.state_dir, ec)) {
+            rr.error = "rotate: cannot create --state-dir " + p.state_dir + ": " + ec.message();
+            return rr;
+        }
+    }
     rr.seqs.resize(static_cast<size_t>(N));
 
     llama_memory_clear(llama_get_memory(engine_.context()), true);

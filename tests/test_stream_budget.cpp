@@ -43,7 +43,8 @@ plan::Plan small_moe() {
     sc.slot_bytes = 1 * MiB;
     sc.n_experts = 64;
     p.slot_classes.push_back(sc);
-    add(p, "token_embd.weight", plan::TensorClass::UnconditionalBulk, 500 * MiB);
+    add(p, "token_embd.weight", plan::TensorClass::RowSliced, 500 * MiB);
+    p.tensors.back().row_gathered = true;
     add(p, "blk.0.attn_q.weight", plan::TensorClass::UnconditionalBulk, 10 * MiB);
     add(p, "output.weight", plan::TensorClass::UnconditionalBulk, 100 * MiB);
     add(p, "blk.0.ffn_gate_exps.weight", plan::TensorClass::RoutedExpert, 64 * MiB);
@@ -68,6 +69,7 @@ LZ_TEST(single_stream_churn_is_three_regions_of_k_doubled_plus_slack) {
     // The widest whole tensor (output, 100 MiB + 25%) is smaller, so slots win.
     LZ_CHECK_EQ(b.churn_reserve, 304 * MiB);
     LZ_CHECK_EQ(b.batch_region_bound, 8 * MiB);   // width 1: exactly k slots
+    LZ_CHECK_EQ(b.funded_union, 8u);              // the fast paths' bound: k
     LZ_CHECK_EQ(b.scratch_bytes, 8 * MiB);        // the 8 MiB floor beats 2 slots
 }
 
@@ -95,13 +97,16 @@ LZ_TEST(eslot_pool_is_the_surplus_after_stream_churn_fallback_and_ring) {
     LZ_CHECK_EQ(b.eslot_pool(100 * GiB), 0u);
 }
 
-LZ_TEST(batch_width_scales_churn_by_the_union_and_disables_the_pool) {
+LZ_TEST(batch_width_scales_churn_by_the_union_and_keeps_the_pool) {
     const StreamBudget b = size_stream(small_moe(), cfg_at(4 * GiB, 4), 4096, StreamFlags{});
     // ceil(64 x (1 - (1 - 8/64)^4)) = ceil(26.48) = 27 distinct experts.
     LZ_CHECK_EQ(b.batch_region_bound, 27 * MiB);
+    LZ_CHECK_EQ(b.funded_union, 27u);   // the same union bounds the fast paths
     LZ_CHECK_EQ(b.churn_reserve, (27 * 3 * 2 + 256) * MiB);
-    LZ_CHECK(!b.eslot_enabled);
-    LZ_CHECK_EQ(b.eslot_pool(0), 0u);
+    // Slots are evictable (make_room asks the pool back), so width no longer
+    // turns the frequency cache off.
+    LZ_CHECK(b.eslot_enabled);
+    LZ_CHECK_GT(b.eslot_pool(0), 0u);
 }
 
 LZ_TEST(no_compact_reserves_a_whole_routed_tensor) {

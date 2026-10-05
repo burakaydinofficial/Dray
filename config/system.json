@@ -1,0 +1,94 @@
+// dray system settings: properties of THIS MACHINE and engine policy.
+//
+// This is the default shipped with the binary. To change a value, copy the
+// key into your own system.json in your user config directory
+// (Windows %APPDATA%\dray, macOS ~/Library/Application Support/dray,
+// otherwise ~/.config/dray; or --config-dir / DRAY_CONFIG_DIR). Your
+// file overrides this one key by key; you only need the keys you change.
+// `dray config -m <model.gguf>` prints every effective value and its source.
+//
+// Values here are the engine's measured defaults on the reference machine
+// (22-thread laptop CPU, PCIe 4.0 NVMe); a different machine may do better
+// with different ones.
+{
+    "schema": 1,
+
+    "threads": {
+        // Compute threads during decode. Decode is bandwidth-bound; on the
+        // reference machine it is flat from 4 threads up.
+        "decode": 4,
+        // Compute threads during prefill. 0 = every core the process may use
+        // (hardware threads minus "reserved").
+        "prefill": 0,
+        // Threads this process runs besides ggml's compute pool (I/O,
+        // completions, main). ggml's pool spin-waits, so letting the total
+        // exceed the cores collapses throughput.
+        "reserved": 9
+    },
+
+    "gpu": {
+        // The HARD limit on what --gpu may hold in VRAM (compute buffer and
+        // weight copies), like --cap for RAM: a size such as "2G". This
+        // engine borrows a part of the machine, it does not take it. Unset
+        // or "0" = automatic: vram_auto_fraction of the card, or
+        // vram_auto_fraction_small on a card of at most vram_small_card.
+        // --vram-cap overrides it. A configuration that cannot fit is
+        // refused at load with the VRAM it needs.
+        "vram_cap": 0,
+        "vram_auto_fraction": 0.25,
+        "vram_auto_fraction_small": 0.5,
+        "vram_small_card": "2G"
+    },
+
+    "io": {
+        // Uncached reads kept in flight. The drive's knee is where adding
+        // depth stops adding bandwidth; `dray calibrate` measures it.
+        "queue_depth": 64
+    },
+
+    "prefill": {
+        // Tokens per prefill graph (the physical batch), CPU only ...
+        "chunk_cpu": 512,
+        // ... and with --gpu, where a larger batch amortises moving weights
+        // across PCIe. The GPU compute buffer grows with it.
+        "chunk_gpu": 2048
+    },
+
+    "cache": {
+        // Share of the bytes a forward pass reads from disk that the expert
+        // frequency cache may copy into its slots in that pass. Admission is
+        // an investment against future reads, paid in copy work during decode.
+        "admit_byte_fraction": 0.10
+    },
+
+    "serve": {
+        // Requests generating at once. Each has its own slot and its own KV
+        // (context --ctx), funded at load and inside --cap: raising this
+        // trades expert cache for parallel clients. They share every step's
+        // weight reads, which is where serving many at once pays.
+        "max_parallel": 1,
+        // Prompt tokens a step may carry besides one token per generating
+        // request. Larger admits new requests faster; smaller keeps the
+        // running streams' steps short.
+        "prefill_tokens_per_step": 256,
+        // A finished conversation stays in its slot (its KV is already paid
+        // for) and the next request sharing its beginning -- a chat's next
+        // turn -- prefills only what is new. After this many idle seconds it
+        // is no longer preferred.
+        "kv_idle_timeout_s": 600,
+        // When a slot is needed for another conversation, the one it held is
+        // parked in RAM instead of lost, and restored into any free slot when
+        // its client continues. The total, in tokens: -1 = --ctx x
+        // max_parallel, 0 = no pool. Parked memory competes only with the
+        // expert frequency cache, never with what streaming needs.
+        "kv_pool_tokens": -1,
+        // Recurrent models (Qwen3.8, Kimi K3, ...) cannot cut their state back
+        // to a shared prefix, so they keep checkpoints of it: this many per
+        // slot, each one sequence's recurrent state, reserved at load inside
+        // --cap. 0 = no reuse for those models. Attention-only models need none.
+        "checkpoints_per_slot": 2,
+        // Where the checkpoint is taken: this many tokens before a prompt's
+        // end, because the next turn re-tokenizes the end of this one.
+        "checkpoint_offset": 4
+    }
+}

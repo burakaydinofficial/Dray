@@ -13,7 +13,6 @@
 
 #include "llama.h"
 
-namespace dray::models { struct Profile; }
 
 namespace dray::engine {
 
@@ -32,8 +31,10 @@ private:
 // Parses "key=int|float|bool|str:value" strings. The earliest entry for a key
 // wins. On failure returns false and names the bad string in *error, in the
 // exact wording the engine has always refused with.
+// `model_defaults` are the model config's kv_defaults: applied after the command
+// line, so an explicit --override-kv for the same key wins.
 bool build_kv_overrides(const std::vector<std::string>& cli,
-                        const models::Profile* profile,
+                        const std::vector<std::string>& model_defaults,
                         KvOverrides* out, std::string* error);
 
 }  // namespace dray::engine

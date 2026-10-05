@@ -46,11 +46,12 @@ struct Rig {
     IoScheduler io{alloc, failures};
     FakeBackend* fake = nullptr;
 
-    explicit Rig(FakeBackend::Script s, size_t shards = 2, bool threaded = false) {
+    explicit Rig(FakeBackend::Script s, size_t shards = 2, bool threaded = false,
+                 uint64_t file_bytes = kFileBytes) {
         std::vector<std::pair<std::string, uint64_t>> files;
         std::vector<std::string> paths;
         for (size_t i = 0; i < shards; ++i) {
-            files.emplace_back("shard" + std::to_string(i), kFileBytes);
+            files.emplace_back("shard" + std::to_string(i), file_bytes);
             paths.push_back("shard" + std::to_string(i));
         }
         auto b = std::make_unique<FakeBackend>(files, s);
@@ -346,6 +347,54 @@ LZ_TEST(read_whole_lands_at_base_plus_head_and_frees_on_failure) {
     LZ_CHECK(bad.io.read_whole(mem::Category::ExpertCache, src(0, 0, 50000), 50000,
                                &alloc, &head) == nullptr);
     LZ_CHECK_EQ(bad.acct.used_in(mem::Category::ExpertCache), 0u);   // freed, not leaked
+}
+
+LZ_TEST(whole_reads_are_chunked_and_every_chunk_is_judged) {
+    // A whole read goes out as requests of at most whole_chunk() bytes: one
+    // request per tensor used to truncate a 28.8 GB table to 3.03 GB (the
+    // length is 32 bits). Scaled down: 64 KiB chunks over a ~3 MiB tensor at an
+    // unaligned offset -- the bytes must land contiguously at base + head.
+    Rig r({});
+    LZ_REQUIRE(r.ok);
+    r.io.set_whole_chunk(64 * 1024);
+    const uint64_t off = 4096 * 9 + 123, bytes = 3 * 1024 * 1024 + 5000;
+    uint64_t alloc = 0;
+    uint32_t head = 0;
+    auto* base = static_cast<uint8_t*>(
+        r.io.read_whole(mem::Category::ExpertCache, src(1, off, bytes), bytes, &alloc, &head));
+    LZ_REQUIRE(base != nullptr);
+    LZ_CHECK_EQ(head, 123u);
+    LZ_CHECK(matches(base + head, 1, off, bytes));
+    LZ_CHECK_GE(r.fake->submit_log().size(), bytes / (64 * 1024));   // really chunked
+    r.alloc.free(mem::Category::ExpertCache, base, alloc);
+
+
+    // The tensor ends at a file end that is NOT aligned: the widened last chunk
+    // runs past EOF and the device returns less than it asked for -- legal, as
+    // it was for the single request, because all of the data arrived.
+    const uint64_t odd_size = kFileBytes - 1000;
+    Rig e({}, 2, false, odd_size);
+    LZ_REQUIRE(e.ok);
+    e.io.set_whole_chunk(64 * 1024);
+    const uint64_t tail_bytes = 200000, tail_off = odd_size - tail_bytes;
+    base = static_cast<uint8_t*>(e.io.read_whole(mem::Category::ExpertCache,
+                                                 src(0, tail_off, tail_bytes), tail_bytes,
+                                                 &alloc, &head));
+    LZ_REQUIRE(base != nullptr);
+    LZ_CHECK(matches(base + head, 0, tail_off, tail_bytes));
+    e.alloc.free(mem::Category::ExpertCache, base, alloc);
+    LZ_CHECK_EQ(e.staging(), 0u);
+
+    // A chunk cut short inside the data fails the whole read, and the memory is
+    // freed (the reads have all landed; nothing is left in flight).
+    FakeBackend::Script s;
+    s.cap_bytes = 40000;   // every request returns at most 40 KB of its 64 KiB
+    Rig bad(s);
+    LZ_REQUIRE(bad.ok);
+    bad.io.set_whole_chunk(64 * 1024);
+    LZ_CHECK(bad.io.read_whole(mem::Category::ExpertCache, src(0, 4096, 500000), 500000,
+                               &alloc, &head) == nullptr);
+    LZ_CHECK_EQ(bad.acct.used_in(mem::Category::ExpertCache), 0u);
 }
 
 LZ_TEST(randomised_mix_never_corrupts_or_leaks) {

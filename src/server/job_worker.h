@@ -1,6 +1,7 @@
-// The single background worker: drains the job registry FIFO under the same
-// admission gate as foreground requests, restores checkpoints for resumed jobs,
-// checkpoints at safepoints, and records each job's terminal state.
+// The background worker: drains the job registry FIFO into the scheduler, where
+// each job runs in a slot of its own alongside foreground requests. Resumed jobs
+// restore their checkpoint into that slot, every job checkpoints at safepoints,
+// and each records its terminal state -- all on the scheduler's thread.
 #pragma once
 
 #include <cstdint>

@@ -1,0 +1,25 @@
+// MiniMax-M3 (GGUF general.architecture "minimax-m3").
+//
+// Everything GGUF exposes is read from the GGUF at load; a model file carries
+// only what the GGUF cannot tell us, plus any policy this model needs to
+// differ on ("overrides": prefill, cache). A "files" object can narrow values
+// to one GGUF file name, e.g. one quant:
+//   "files": { "MiniMax-M3-UD-Q2_K_XL-00001-of-00004.gguf": { "overrides": { ... } } }
+{
+    "schema": 1,
+    "arch": "minimax-m3",
+
+    // The released UD conversions predate the loader's five REQUIRED indexer
+    // hyperparameter keys (first light 2026-08-20: "key not found in model:
+    // minimax-m3.attention.indexer.head_count"). Values verified against
+    // MiniMaxAI/MiniMax-M3 config.json, field by field: sparse_num_index_heads=4,
+    // sparse_index_dim=128, sparse_topk_blocks=16, sparse_block_size=128,
+    // sparse_local_block=1. An explicit --override-kv for the same key wins.
+    "kv_defaults": [
+        "minimax-m3.attention.indexer.head_count=int:4",
+        "minimax-m3.attention.indexer.key_length=int:128",
+        "minimax-m3.attention.indexer.top_k=int:16",
+        "minimax-m3.attention.indexer.block_size=int:128",
+        "minimax-m3.attention.indexer.local_blocks=int:1"
+    ]
+}

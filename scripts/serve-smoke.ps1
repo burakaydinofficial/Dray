@@ -11,7 +11,9 @@ param(
     [string]$OutDir,
     [int]$Port = 18089,
     [string]$Name = "dray",
-    [string]$Model = "D:\Models\testbed\OLMoE\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf"
+    [string]$Model = "D:\Models\testbed\OLMoE\OLMoE-1B-7B-0924-Instruct-Q4_K_M.gguf",
+    # Extra server flags, e.g. "--parallel 4": the same checks, another shape.
+    [string]$ServeArgs = ""
 )
 
 $ErrorActionPreference = "Continue"
@@ -27,7 +29,7 @@ function Rec($k, $v) { $lines.Add("${k}: $v") }
 
 [Environment]::SetEnvironmentVariable("$($Name.ToUpper())_CKPT_EVERY", "4")
 function Start-Server($tag) {
-    $a = "serve -m `"$m`" --cap 4G --force-stream --ctx 512 --port $Port --jobs-dir `"$jobs`""
+    $a = "serve -m `"$m`" --cap 4G --force-stream --ctx 512 --port $Port --jobs-dir `"$jobs`" $ServeArgs"
     $p = Start-Process -FilePath $bin -ArgumentList $a -NoNewWindow -PassThru `
         -RedirectStandardError (Join-Path $OutDir "serve-$tag.log.txt") `
         -RedirectStandardOutput (Join-Path $OutDir "serve-$tag.out.log.txt")
@@ -93,8 +95,19 @@ foreach ($l in ($sse -split "`n")) {
 Rec "sse.content" ($acc | ConvertTo-Json -Compress); Rec "sse.finish" $fin
 Rec "sse.matches_chat" ($acc -eq $j.choices[0].message.content)
 
+# Tools: a malformed definition is refused; a valid one is accepted and the
+# response is a well-formed completion (whether the model calls it is the
+# model's business: the finish reason is recorded, not required).
 $r = Post "/v1/chat/completions" @{ messages = $msg; tools = @(@{ type = "function" }) }
+Rec "tools.malformed.code" $r.code
+$tool = @{ type = "function"; function = @{ name = "get_weather"; description = "Weather for a city";
+           parameters = @{ type = "object"; properties = @{ city = @{ type = "string" } }; required = @("city") } } }
+$r = Post "/v1/chat/completions" @{ messages = $msg; tools = @($tool); max_tokens = 12; temperature = 0 }
 Rec "tools.code" $r.code
+if ($r.code -eq "200") {
+    $tj = $r.body | ConvertFrom-Json
+    Rec "tools.finish" $tj.choices[0].finish_reason
+}
 $r = Post "/v1/chat/completions" "{not json" -Raw
 Rec "badjson.code" $r.code
 $r = Post "/v1/chat/completions" @{ temperature = 0 }

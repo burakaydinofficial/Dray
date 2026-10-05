@@ -14,11 +14,12 @@
 //   ExpertCompactor  MUL_MAT_ID compaction, GET_ROWS row slicing, Phases A and C
 //   ExpertSlots      the frequency expert cache (with RoutingSkew)
 //   UncondRing       Phase B, the unconditional stream read ahead
-//   HitRates, Repacker, PrivateIds
+//   HitRates, PrivateIds
 
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 
 #include "backend/accounted_alloc.h"
@@ -28,7 +29,6 @@
 #include "backend/io_scheduler.h"
 #include "backend/poison_buffers.h"
 #include "backend/private_ids.h"
-#include "backend/repacker.h"
 #include "backend/residency_cache.h"
 #include "backend/routing_skew.h"
 #include "backend/stream_buffer.h"
@@ -60,7 +60,6 @@ struct Streamer::Impl {
     TensorRegistry    tensors;
     ResidencyCache    cache;
     HitRates          hits;
-    Repacker          repacker;
     PrivateIds        ids;
     RoutingSkew       skew;
     ExpertSlots       slots;
@@ -77,6 +76,10 @@ struct Streamer::Impl {
     // dominate the wall clock, the gap is ours and fixable; if they do not, it
     // is elsewhere. (The I/O-side counters live in IoStats.)
     uint64_t ns_materialise = 0;
+    // ggml's own compute of claimed nodes: from the end of materialise() to the start of
+    // release() -- the node graph launched, run and joined by the CPU thread pool.
+    uint64_t ns_node_compute = 0;
+    std::chrono::steady_clock::time_point t_mat_end{};
     uint64_t ns_release = 0;
     uint64_t n_materialise = 0;
     // ns_materialise split by what the node was waiting for. Time in materialise is
@@ -108,8 +111,8 @@ struct Streamer::Impl {
         : plan(p), cfg(c), flags(StreamFlags::from_env()),
           mem(a), poison(mem), io(mem, failures),
           cache(mem, poison, tensors),
-          repacker(flags.repack), ids(flags.trace_compact),
-          slots(mem, cache, skew, flags.no_eslots),
+          ids(flags.trace_compact),
+          slots(mem, cache, skew, flags.no_eslots, cfg.admit_byte_fraction),
           compactor({mem, io, cache, tensors, ids, slots, skew, hits}, flags, cfg.n_seq, failures),
           ring({mem, io, cache, tensors, hits}, flags.no_retain) {
         if (!flags.no_pool) {
@@ -132,7 +135,40 @@ struct Streamer::Impl {
     // A whole tensor, from wherever it is cheapest: residency, then the ring,
     // then a direct read from disk. False = it could not be materialised; `t`
     // then points at poison, never at null.
-    bool bring_in(ggml_tensor* t, uint64_t* streamed);
+    // `transient`: brought in only to be copied elsewhere (a GPU split's input):
+    // never pinned static, and evictable with the routed experts, first.
+    bool bring_in(ggml_tensor* t, uint64_t* streamed, bool transient = false);
+
+    // The region a GPU split's copy reads, between copy_begin and copy_end
+    // (ExpertCompactor::read_experts_for_copy): freed after the copy, and the
+    // tensor points back where it pointed before.
+    struct CopyLanding {
+        ggml_tensor* w = nullptr;
+        ggml_tensor* t = nullptr;
+        uint8_t*     mem = nullptr;
+        uint64_t     bytes = 0;
+        void*        w_data = nullptr;
+        void*        t_data = nullptr;
+    };
+    CopyLanding landing;
+    // GPU split copies (copy_begin / copy_end): how many, the time spent making the
+    // weight present (reads), and the time from then until the copy had completed --
+    // the scheduler's copy plus its device drain. Printed only when any happened.
+    uint64_t copies = 0;
+    uint64_t ns_copy_ready = 0;
+    uint64_t ns_copy_done = 0;
+    std::chrono::steady_clock::time_point copy_t1{};
+    // Every routed-expert tensor's bytes (the plan's tensor table). Whole GPU
+    // copies stay cached only if ALL of them fit the cache budget; otherwise
+    // a pass cycles them out before reuse and routed-only reads win.
+    uint64_t routed_bytes = 0;
+    uint64_t routed_max[ExpertCompactor::kCopyKinds] = {};   // largest routed tensor per kind
+    // The GPU copy pool (set_gpu_copy_pool): where routed experts land for a GPU
+    // split's copy -- host memory the GPU backend DMAs from directly, charged to the
+    // cap by the engine. Empty: copies land in ordinary cache memory.
+    void*    pinned_buf = nullptr;   // ggml_backend_buffer_t
+    uint8_t* pinned = nullptr;
+    uint64_t pinned_bytes = 0;
 };
 
 }  // namespace dray::backend

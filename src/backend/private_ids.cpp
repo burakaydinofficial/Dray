@@ -3,11 +3,17 @@
 #include <algorithm>
 #include <cstdio>
 
+#include "ggml-backend.h"
+
 namespace dray::backend {
 
 bool derive_ids_map(ggml_tensor* ids, int64_t n_expert,
                     std::vector<int32_t>* uniq, std::vector<int32_t>* remapped) {
     if (!ids->data) return false;
+    // Ids computed on another device (a GPU split in --gpu prefill) live in its
+    // memory: `data` is a device handle, and reading it here was an access
+    // violation that killed the server on a second request (2026-09-30).
+    if (ids->buffer && !ggml_backend_buffer_is_host(ids->buffer)) return false;
     const int64_t n0 = ids->ne[0], n1 = ids->ne[1];
     if (n0 <= 0 || n1 <= 0) return false;
 
