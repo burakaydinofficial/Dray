@@ -785,6 +785,12 @@ uint64_t Streamer::batch_region_bytes() const {
     return impl_ ? impl_->batch_region_bound : 0;
 }
 
+uint64_t Streamer::yield_ring() {
+    // The expert slot pool keeps the size it was given beside the ring: what the
+    // ring returns goes to the cache, which is what came up short.
+    return impl_ ? impl_->ring.yield_unused() : 0;
+}
+
 uint64_t Streamer::largest_streamed_bytes() const {
     if (!impl_) return 0;
     uint64_t b = 0;

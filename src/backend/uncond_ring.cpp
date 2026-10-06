@@ -11,6 +11,15 @@ void UncondRing::allocate(uint64_t bytes, uint32_t align) {
     if (arena_) bytes_ = bytes;
 }
 
+uint64_t UncondRing::yield_unused() {
+    if (!arena_ || active_ || !queue_.empty()) return 0;
+    const uint64_t freed = bytes_;
+    p_.mem.free(mem::Category::IoStaging, arena_, bytes_);
+    arena_ = nullptr;
+    bytes_ = 0;
+    return freed;
+}
+
 void UncondRing::record_consumption(ggml_tensor* t) {
     if (!arena_ || active_) return;
     const Source* s = p_.tensors.source_of(t);

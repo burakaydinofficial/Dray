@@ -19,7 +19,6 @@ const char* const kDrayEnvVars[] = {
     "DRAY_NO_EARLY",
     "DRAY_NO_ESLOTS",
     "DRAY_NO_FUSE",
-    "DRAY_ROTATE_UNSAFE",
     "DRAY_FAST_NODES",
     "DRAY_NO_REPACK",
     "DRAY_NO_POOL",

@@ -25,11 +25,12 @@ if (-not (Test-Path $bin)) { Write-Host "*** binary not found at $bin -- build f
 $out = Join-Path $env:TEMP "dray-residenttest"
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 
-function Leg([string]$tag, [string[]]$extra) {
+function Leg([string]$tag, [string[]]$extra, [hashtable]$levers = @{}) {
     # Clear every DRAY_* lever: an ambient one changes what both legs do, and
     # two legs perturbed identically still compare IDENTICAL (2026-08-24 audit).
     Get-ChildItem Env: | Where-Object { $_.Name -like 'DRAY_*' } |
         ForEach-Object { Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue }
+    foreach ($k in $levers.Keys) { Set-Item "Env:$k" $levers[$k] }
     $f = Join-Path $out "$tag.txt"
     # --threads 4 PINS both phases: this gate isolates the ALLOCATION PATH, so
     # every other variable must be held constant. Thread count changes matmul
@@ -38,6 +39,7 @@ function Leg([string]$tag, [string[]]$extra) {
     # last bits -- documented, not a bug, but it would mask a real one here.
     $a = @("run", "-m", $Model, "--cap", $Cap, "--threads", "4", "--ctx", "512", "-n", "$Tokens", "-p", $Prompt) + $extra
     & $bin @a *> $f
+    foreach ($k in $levers.Keys) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
     if ($LASTEXITCODE -ne 0) { Write-Host "*** $tag exited $LASTEXITCODE -- VOID ***"; exit 3 }
     if (Select-String -Path $f -Pattern "NOT TRUSTWORTHY|CAP BREACH|REFUSED" -Quiet) {
         Write-Host "*** $tag TAINTED -- VOID ***"; exit 3
@@ -55,7 +57,19 @@ function Leg([string]$tag, [string[]]$extra) {
 }
 
 $streamText = Leg "stream" @("--force-stream")
-$residentText = Leg "resident" @("--resident")
+# The resident leg runs WITHOUT the repacked kernels: this gate isolates who
+# allocated the weights, and repacked kernels are different arithmetic (a near-tie
+# flip within 24 tokens on the testbed). Until 2026-10-05 resident mode never
+# reached them -- a duplicate CPU backend kept every layer in a plain buffer -- so
+# the pin changes nothing this gate used to compare.
+$residentText = Leg "resident" @("--resident") @{ DRAY_NO_REPACK = "1" }
+# Repacked resident (the shipped default): reported, never required to match.
+$repackText = Leg "repacked" @("--resident")
+$agree = 0
+while ($agree -lt [Math]::Min($streamText.Length, $repackText.Length) -and $streamText[$agree] -ceq $repackText[$agree]) { $agree++ }
+$engaged = Select-String -Path (Join-Path $out "repacked.txt") -Pattern "CPU_REPACK model buffer" -Quiet
+Write-Host ("repacked resident     : agrees with streaming for {0} of {1} chars (reported, not required){2}" -f $agree, $streamText.Length,
+    $(if ($engaged) { "" } else { " -- NOTE: the repacked kernels did not engage" }))
 
 # The resident leg must actually have taken the resident path, or this gate is
 # vacuous -- exactly the trap --force-stream exists to prevent elsewhere.

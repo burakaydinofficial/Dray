@@ -59,9 +59,12 @@ $cases = [ordered]@{
     "run_kvq4"      = @{ a = @("run", "-m", $m, "--cap", "4G", "--force-stream", "--ctx", "1024", "--kv", "q4", "-n", "16", "-p", $p) }
     "run_stop"      = @{ a = @("run", "-m", $m, "--cap", "4G", "--force-stream", "--ctx", "512", "-n", "32", "--stop", "Euro", "-p", $p) }
     "run_refused"   = @{ a = @("run", "-m", $m, "--cap", "256M", "--force-stream", "--ctx", "512", "-n", "8", "-p", $p) }
+    # Fits only once the read-ahead ring gives its arena to the cache.
+    "run_ringyield" = @{ a = @("run", "-m", $m, "--cap", "320M", "--force-stream", "--ctx", "512", "-n", "16", "-p", $p) }
     "batch4"        = @{ a = @("batch", "-m", $m, "--cap", "4G", "--force-stream", "--ctx", "512", "--batch", "4", "-n", "12", "-p", $p) }
     "snaptest"      = @{ a = @("snaptest", "-m", $m, "--cap", "4G", "--force-stream", "--ctx", "512", "-p", $p) }
     "rotate"        = @{ a = @("batch", "-m", $m, "--cap", "4G", "--force-stream", "--ctx", "512", "--batch", "2", "--prompts", "$PSScriptRoot\golden-prompts.txt", "-n", "10", "--rotate", "10", "--state-dir", "$env:TEMP\dray-golden-state") }
+    "rotate_park"   = @{ a = @("batch", "-m", $m, "--cap", "4G", "--force-stream", "--ctx", "512", "--batch", "2", "--prompts", "$PSScriptRoot\golden-prompts.txt", "-n", "10", "--rotate", "3", "--state-dir", "$env:TEMP\dray-golden-state-park") }
     "batch_prompts" = @{ a = @("batch", "-m", $m, "--cap", "4G", "--force-stream", "--ctx", "512", "--batch", "4", "--prompts", "$PSScriptRoot\golden-prompts.txt", "-n", "10", "--stop", "Paris") }
 }
 # One case per streamer lever, so every path the streamer can take has a baseline.

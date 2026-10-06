@@ -203,6 +203,11 @@ public:
     // knew at load).
     uint64_t churn_reserve_bytes() const;
     uint64_t batch_region_bytes() const;
+    // Admission, before refusing: the read-ahead ring only buys speed, so a cap
+    // that cannot hold what a node needs beside it runs without it instead of
+    // not at all. Frees the ring's arena (never used yet at admission) and
+    // returns the bytes given back to the cache; 0 if there was no ring.
+    uint64_t yield_ring();
     // The expert slot pool's size: memory the streamer can do without. Other
     // optional caches (parked conversations) may compete for it -- never more.
     uint64_t spare_cache_bytes() const;

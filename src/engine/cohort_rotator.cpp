@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <system_error>
 #include <string>
@@ -22,26 +21,11 @@ RotateResult CohortRotator::run(const RotateParams& p) {
     if (N < 1) { rr.error = "rotate: no prompts"; return rr; }
     if (W < 1) { rr.error = "rotate: plan funded no sequences"; return rr; }
     if (p.span < 1) { rr.error = "rotate: span must be >= 1"; return rr; }
-    // MEASURED (2026-08-19, testbed bisection): cohort slot recycling is
-    // deterministic; the llama_state_seq park/restore roundtrip is NOT --
-    // set_data reports success yet reruns of the identical command diverge,
-    // the signature of restored-state bookkeeping desync reading
-    // uninitialized cells. Until the fork's multi-stream state serialization
-    // is proven, rotation refuses mid-generation parking: each cohort runs
-    // to completion, then rotates. That is the throughput use case; spans
-    // below max_tokens buy only latency fairness and are not worth wrong
-    // tokens.
-    const bool rot_unsafe = [] {
-        const char* v = std::getenv("DRAY_ROTATE_UNSAFE");
-        return v && v[0] == '1';
-    }();
-    if (p.span < p.max_tokens && !rot_unsafe) {
-        rr.error = "rotate: span " + std::to_string(p.span) + " < max_tokens " +
-                   std::to_string(p.max_tokens) + " requires mid-generation state parking, which is "
-                   "NOT yet proven bit-exact in this build (reruns diverge); use --rotate >= " +
-                   std::to_string(p.max_tokens) + " (run-to-completion cohorts)";
-        return rr;
-    }
+    // A span below max_tokens parks live sequences mid-generation and restores
+    // them on the cohort's next turn. That was refused from 2026-08-19, when
+    // identical reruns diverged; it stopped reproducing (2026-09-29), and
+    // scripts/rotategate.ps1 now requires parked runs to equal run-to-completion
+    // token for token, on attention KV and on recurrent state.
     if (p.state_dir.empty()) { rr.error = "rotate: --state-dir is required (rotation writes; where is an explicit choice)"; return rr; }
     // Created here, or refused here with the reason: a missing directory used to
     // surface only as "state park failed" on every sequence, mid-run.
@@ -124,8 +108,6 @@ RotateResult CohortRotator::run(const RotateParams& p) {
     auto state_path = [&](int32_t g) {
         return p.state_dir + "/g" + std::to_string(g) + ".state";
     };
-    const bool keep_states = rot_unsafe;   // diagnostics: copy each park aside
-    int32_t park_no = 0;
     auto park = [&](int32_t g, int32_t slot) -> bool {
         const size_t sz = llama_state_seq_get_size(engine_.context(), slot);
         if (sz == 0) return false;
@@ -138,10 +120,6 @@ RotateResult CohortRotator::run(const RotateParams& p) {
         std::fclose(f);
         if (wr != got) return false;
         rr.state_bytes_written += wr;
-        if (keep_states) {
-            FILE* k = std::fopen((state_path(g) + ".park" + std::to_string(park_no++)).c_str(), "wb");
-            if (k) { std::fwrite(buf.data(), 1, got, k); std::fclose(k); }
-        }
         return true;
     };
     auto unpark = [&](int32_t g, int32_t slot) -> bool {
@@ -308,8 +286,6 @@ RotateResult CohortRotator::run(const RotateParams& p) {
                 const int32_t g = g0 + s;
                 RSeq& q = gs[static_cast<size_t>(g)];
                 if (q.admitted && q.prefilled && q.live && q.done < p.max_tokens) {
-                    // Diagnostics under DRAY_ROTATE_UNSAFE: keep a copy of
-                    // each park for byte-comparison across reruns.
                     if (!park(g, s)) {
                         q.live = false;
                         rr.seqs[static_cast<size_t>(g)].error = "rotate: state park failed";
@@ -321,7 +297,10 @@ RotateResult CohortRotator::run(const RotateParams& p) {
             int32_t done_ct = 0;
             for (int32_t g = 0; g < N; ++g) {
                 const RSeq& q = gs[static_cast<size_t>(g)];
-                if (!q.admitted || !q.live || q.done >= p.max_tokens) ++done_ct;
+                // Finished: refused, or started and then stopped. A sequence
+                // whose cohort has not run yet is not live either, but it is
+                // not done.
+                if (!q.admitted || (q.prefilled && (!q.live || q.done >= p.max_tokens))) ++done_ct;
             }
             if (p.on_round) p.on_round(static_cast<int32_t>(rr.rounds), c, done_ct);
         }

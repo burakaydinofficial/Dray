@@ -29,6 +29,15 @@ claim was made by waving at load overhead instead of measuring the windowed
 rate. When the model fits, you gain a memory cap you do not need and pay 20 to
 45% for it.
 
+> **These three rows predate two fixes (2026-10-05) and must be re-measured.**
+> Every CPU run built and joined a fresh ggml thread pool per graph node (a
+> duplicate CPU backend never received the persistent pool), and resident mode
+> never reached llama's repacked kernels for the same reason. Fixed, the testbed
+> decodes about 2x faster and Qwen3.6 35B-A3B about 4x (streaming, 12 GiB) --
+> before and after interleaved on one machine, ranges far apart. The absolute
+> figures above need a quiet machine, which that day was not, so they stand
+> unchanged until re-run.
+
 This engine earns its keep on ONE thing: models that do not fit. A 594 GB
 checkpoint under an 8 GiB cap is not slower elsewhere, it is impossible
 elsewhere. When the model does not fit, the streaming path costs roughly 2x
@@ -86,10 +95,15 @@ lab notebook this repository carries; the per-cell data is in
 | MiniMax-M3 429B | 143 GB | 28 GiB | 5.3 s/token | 3.30 GiB |
 | GLM-5.2 744B | 217 GB | 8 GiB | 8.6 s/token | 12.80 GiB |
 | GLM-5.2 744B | 217 GB | 28 GiB | 8.3 s/token | 5.45 GiB |
-| Kimi K3 2.8T | 594 GB | **9 GiB** | 25.8 s/token (22.7 over 32 tokens) | 46.22 GiB |
+| Kimi K3 2.8T | 594 GB | 9 GiB | 25.8 s/token (22.7 over 32 tokens) | 46.22 GiB |
 | Kimi K3 2.8T | 594 GB | 28 GiB | 24.3 s/token | 27.22 GiB |
 
-Bold caps are the measured minimum that still produces correct text. All rows:
+Bold caps are the measured minimum that still produces correct text. Kimi K3's
+minimum is now **5 GiB** (2026-10-05, this build): correct text over 32 tokens at
+4k context, 4.6 GB resident, about 56 GB read per token. At that cap the
+read-ahead ring gives its memory to the cache, and the run says so. Its speed
+was not measured: the machine was shared, and a timing taken that way would be
+noise. All other rows:
 4k context, CPU only, `--kv q4` (K3 uses f16, the only setting it accepts), 32
 generated tokens, one methodology and one build. Reproduce with
 `scripts/matrix.ps1`; every cell including 32k context and GPU is in
@@ -161,7 +175,10 @@ per-sequence state (KV plus recurrent), not the weight cache: at width 32 and
 4k context it is two thirds of the 28 GiB budget. More prompts than the cap
 funds can rotate through in cohorts (`--rotate`), with state parked to a
 directory you choose -- the engine's only sustained-write feature, opt-in,
-and its write bytes are reported like every read.
+and its write bytes are reported like every read. A span shorter than the
+generation parks sequences mid-generation and resumes them later, token for
+token identical to running them straight through (`scripts/rotategate.ps1`,
+attention KV and recurrent state).
 
 Correctness is sealed on **Windows, Linux, and macOS (Apple silicon)** with identical
 node counts on all three; performance figures above are Windows, on the drive named in
@@ -171,8 +188,10 @@ pocket SSD in 3 GiB of RAM.
 > **Correction (2026-08-24).** Earlier versions of this table claimed Kimi K3 at a
 > 6 GiB minimum and 8 GiB/16.1 s per token. Neither reproduces on the current
 > build: 8 GiB is REFUSED at both 4k and 2k context because output.weight needs
-> 918 MiB whole and the cap leaves about 200 MiB of cache. The measured floor is
-> 9 GiB, where K3 answers correctly at 22.7 s/token and 46.2 GB/token. The
+> 918 MiB whole and the cap leaves about 200 MiB of cache. The measured floor was
+> 9 GiB, where K3 answers correctly at 22.7 s/token and 46.2 GB/token (since
+> 2026-10-05 it is 5 GiB: a fork fix returned 3.5 GB of unused scheduler memory,
+> and the read-ahead ring now yields to output.weight instead of refusing). The
 > earlier figures were taken before the resident-byte ledger reached its current
 > honesty, the same way the Qwen3.8 note below describes. Also note `--kv q4` does
 > NOT work on K3 at all: quantised KV forces flash attention and context creation
@@ -292,9 +311,6 @@ measurement is reproducible from its output. Bisect switches: `NO_FUSE`,
 `METAL` (macOS, experimental), `ALLOW_DEGRADED` (accept a backend that cannot
 do uncached reads; the cap becomes unenforceable and the run says so).
 Tuning: `RING_MB`, `CKPT_EVERY`,
-`CKPT_SECONDS`, `RESUME_ATTEMPTS`. Diagnostics: `TRACE`, `TRACE_COMPACT`,
-`ROTATE_UNSAFE` (bypasses the rotation span guard and keeps parked-state
-copies for byte comparison; the guarded regime is measurably
-nondeterministic and this knob exists to diagnose it, not to use it). The
+`CKPT_SECONDS`, `RESUME_ATTEMPTS`. Diagnostics: `TRACE`, `TRACE_COMPACT`. The
 canonical list lives in `src/config/env_report.cpp` and a census test keeps
 it honest.

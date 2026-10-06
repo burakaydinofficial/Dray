@@ -39,8 +39,9 @@ GB/token (0 bytes at 28 GiB, fully resident), 122B-A10B 0.406, DeepSeek 0.892.
 The 122B clears width 96 on 28 GiB. The --gpu prefill figures of 2026-08
 (22 seconds for a 6,594-token prompt, 12-72x) are WITHDRAWN: streamed --gpu
 computed on poison until 2026-09-30 (DECISIONS; gated by gpugate). Resident mode (opt-out, when the
-model fits the cap) is correct but 21-46% SLOWER than stock llama.cpp (measured
-2026-08-24) -- if a model fits, use llama.cpp. --force-stream pins the
+model fits the cap) is correct; it measured 21-46% SLOWER than stock llama.cpp (2026-08-24),
+but that was before the 10-05 fixes (a disposable thread pool per node on every CPU run, and
+resident never reaching the repacked kernels) -- re-measure before quoting. If a model fits, use llama.cpp. --force-stream pins the
 streaming path and every gate uses it.
 
 Correctness is sealed on Windows/Linux/macOS at identical node counts; the
@@ -53,9 +54,9 @@ left to share once a token costs under a gigabyte; read the absolute column.
 Over-width runs refuse AT LOAD with the required cap priced. Width is bound by
 per-sequence state (KV + recurrent), not the weight cache -- which is why the
 122B reaches width 96 (176 MiB per sequence) where K3 stops at 44 (~1 GB). Cohort rotation (`--rotate`, opt-in, write-honest,
-`--state-dir` explicit) serves deeper queues; mid-generation parking is still guarded
-off until gated, though the 08-19 restore nondeterminism no longer reproduces: park/restore
-is bit-exact on both bases, attention and recurrent (2026-09-29, DECISIONS). The original build-order paragraph is preserved in git history; its
+`--state-dir` explicit) serves deeper queues, parking sequences mid-generation when the
+span is shorter than the output: token for token identical to running straight through,
+attention and recurrent (rotategate, 2026-10-05; the 08-19 nondeterminism no longer reproduces). The original build-order paragraph is preserved in git history; its
 M3-first plan was overtaken by events — K3 support arrived via an upstream community PR
 carried in the vendored fork, and GLM-5.2 joined as the small flagship. MiniMax M3 is
 measured (2026-08-20: correct text at 8 GiB, 4.61 GiB/token — the model config kv_defaults
@@ -93,14 +94,16 @@ scripts/batchdiff.ps1    # within-batch identity, and compact ON vs OFF
 scripts/archgate.ps1     # ARCHITECTURE DIVERSITY -- slow, before shipping
 scripts/clonegate.ps1    # DOES THIS BUILD FOR A STRANGER -- before any push
                          # that touches the submodule or build files
-scripts/golden.ps1       # DID A REFACTOR CHANGE ANYTHING -- 25 cases (every
-scripts/serve-smoke.ps1  # command + every streamer lever), and every server
+scripts/golden.ps1       # DID A REFACTOR CHANGE ANYTHING -- every
+scripts/serve-smoke.ps1  # command and every streamer lever -- and every server
                          # route incl. crash-resume; record before, compare after
 scripts/serve-parallel.ps1 # 8 clients on 4 slots: all answer; each vs its serial answer
 scripts/serve-reuse.ps1  # a 3-turn chat + an edited history vs a fresh server: reuse
                          # (KV cut or recurrent checkpoint) answers what a fresh one does
 scripts/gpugate.ps1      # --gpu (a Vulkan build): streaming BIT-IDENTICAL to llama's own
                          # GPU path; before anything touching --gpu, the fork or weight delivery
+scripts/rotategate.ps1   # --rotate parking mid-generation == running straight through, token for
+                         # token, attention + recurrent; before anything touching rotation or state
 ```
 
 `archgate` is the newest and exists because the other three cannot catch what

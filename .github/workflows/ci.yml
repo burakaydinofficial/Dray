@@ -13,6 +13,10 @@ name: ci
 # uncached board here costs ~400 billed minutes. Hence: docs pushes don't
 # build, overlapping runs cancel, compiler caches cut the vendored build, and
 # macOS -- 10x for a platform already proven green -- runs on manual dispatch.
+#
+# GGML_NATIVE=OFF everywhere: the build directory is cached across runners with
+# different CPUs, and a native build restored onto an older one dies with an
+# illegal instruction in the compaction test.
 on:
   push:
     paths-ignore:
@@ -39,7 +43,7 @@ jobs:
       - name: configure
         # No -G pin: windows-latest moved from VS 2022 to VS 2026 and the pin
         # broke the maiden run; the default generator tracks the image.
-        run: cmake -B build -DGGML_METAL=OFF -DGGML_CUDA=OFF
+        run: cmake -B build -DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_NATIVE=OFF
       - name: build
         run: cmake --build build --config Release -j
       - name: unit tests
@@ -62,7 +66,7 @@ jobs:
           key: ${{ runner.os }}-${{ github.job }}-${{ hashFiles('CMakeLists.txt', 'CMakePresets.json', '.gitmodules') }}
           restore-keys: ${{ runner.os }}-${{ github.job }}-
       - name: configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=OFF -DGGML_CUDA=OFF
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_NATIVE=OFF
       - name: build
         run: cmake --build build -j
       - name: unit tests
@@ -86,7 +90,7 @@ jobs:
       - name: ninja
         run: choco install ninja -y
       - name: configure (documented path)
-        run: cmake --preset dev
+        run: cmake --preset dev -DGGML_NATIVE=OFF
       - name: build (documented path)
         run: cmake --build --preset dev -j
       - name: unit tests (documented path)
@@ -110,7 +114,7 @@ jobs:
       - name: io_uring headers
         run: sudo apt-get update && sudo apt-get install -y liburing-dev
       - name: configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGGML_METAL=OFF -DGGML_CUDA=OFF -DCMAKE_CXX_FLAGS="-fsanitize=thread" -DCMAKE_C_FLAGS="-fsanitize=thread" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGGML_METAL=OFF -DGGML_CUDA=OFF -DCMAKE_CXX_FLAGS="-fsanitize=thread" -DCMAKE_C_FLAGS="-fsanitize=thread" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" -DGGML_NATIVE=OFF
       - name: build
         # bare -j is UNLIMITED make parallelism; the heavy vendored TUs OOM a
         # 16 GB runner (cc1plus Killed, run 2). Bound it to the core count.
@@ -134,7 +138,7 @@ jobs:
       - name: io_uring headers
         run: sudo apt-get update && sudo apt-get install -y liburing-dev
       - name: configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=OFF -DGGML_CUDA=OFF
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=OFF -DGGML_CUDA=OFF -DGGML_NATIVE=OFF
       - name: build
         # bare -j is UNLIMITED make parallelism; see linux-tsan note.
         run: cmake --build build -j 4

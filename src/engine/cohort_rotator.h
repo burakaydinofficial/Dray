@@ -3,9 +3,10 @@
 // KV/recurrent state to state_dir, and the next cohort loads. Opt-in only: the
 // engine's one sustained-write feature (writes are reported like reads).
 //
-// Mid-generation parking (span < max_tokens) is refused unless
-// DRAY_ROTATE_UNSAFE=1: the fork's llama_state_seq restore is measurably
-// nondeterministic (DECISIONS), so cohorts run to completion and then rotate.
+// span >= max_tokens: each cohort runs to completion, nothing is parked.
+// span < max_tokens: sequences are parked mid-generation and resumed on the
+// cohort's next turn, token-for-token identical to running to completion
+// (scripts/rotategate.ps1).
 #pragma once
 
 #include "engine/engine_types.h"

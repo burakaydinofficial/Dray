@@ -52,6 +52,10 @@ public:
     // Allocates the arena; a refusal just means no ring (the sync path serves).
     void     allocate(uint64_t bytes, uint32_t align);
     uint64_t bytes() const { return bytes_; }
+    // Frees the arena back to the cache, leaving no ring -- exactly the state a
+    // refused allocation leaves. Only before the ring has ever run (nothing is in
+    // flight into it); returns the bytes freed, 0 if it could not.
+    uint64_t yield_unused();
 
     // PASS 1: the graph declares its real working set by consuming it. The stream
     // list is built from THIS, not from creation order: the GGUF carries tensors

@@ -54,6 +54,12 @@ The README's per-model performance table predates this work (older build,
 Balanced plan) and understates the current engine; it will be re-measured as a
 whole rather than patched row by row.
 
+**Since then (2026-10-05).** Every CPU run had built a ggml thread pool per graph
+node (see Compute); with that fixed the testbed decodes about 2x faster and
+Qwen3.6 35B-A3B about 4x, and `--gpu` decode no longer trails the CPU (see GPU).
+K3's minimum cap is 5 GiB (see Memory). K3's speed after the thread-pool fix has
+not been measured yet: that needs a quiet machine.
+
 ---
 
 ## Memory: the cap means total resident bytes
@@ -91,8 +97,19 @@ batch width. Flash Next at width 2: -46% decode bytes; MiniMax-M3 at 28 GiB and 
 **Measured minimum caps** (correct text required; below them the engine refuses at
 load and names a cap that works): Qwen3.6 35B-A3B 3 GiB, Qwen3.5 122B-A10B 3 GiB,
 DeepSeek V4 Flash 3 GiB, Qwen3.8-27B dense 4 GiB (1-bit: 3 GiB), MiniMax-M3 4 GiB,
-GLM-5.2 3 GiB, Qwen3.8 2.4T 5 GiB, Kimi K3 9 GiB. K3's floor is set by
+GLM-5.2 3 GiB, Qwen3.8 2.4T 5 GiB, Kimi K3 5 GiB. K3's floor is set by
 `output.weight` (918 MiB), which must be materialised whole.
+
+**An optional buffer never decides whether a run fits (2026-10-05).** K3 at 5 GiB
+was refused -- 891 MiB of cache against `output.weight`'s 918 -- while a 640 MiB
+read-ahead ring sat in the same cap. The ring only overlaps reads with compute (the
+output is identical without it), so admission now frees it before refusing,
+re-measures, and refuses only if the cache still falls short, saying the ring was
+already off. K3 at 5 GiB and 4k context: correct text over 32 tokens, 4.6 GB
+resident, ~56 GB read per token; 4 GiB stays refused (508 MiB of cache). The 1B-7B
+testbed's minimum moves from 400 to 300 MiB. Configurations that ran before are
+untouched. Going below 5 GiB on K3 means splitting the final projection, which llama
+builds separately in every model's graph code.
 
 ---
 
@@ -118,9 +135,11 @@ error. The gates exist because of specific escapes:
   five architectures.
 
 **The gates.** `difftest` (compaction on/off, byte-identical text), `residenttest`
-(llama's allocator vs the streaming path), `batchdiff` (within-batch identity), `golden`
-(25 cases: every command and lever, text and counters), `serve-smoke` (every server
-route, including crash-resume), `archgate` (short greedy generations on five
+(llama's allocator vs the streaming path, with the same kernels on both legs; the
+repacked kernels resident mode uses by default are compared and reported, never
+required), `batchdiff` (within-batch identity), `golden` (every command and lever,
+text and counters), `rotategate` (parking mid-generation vs running straight
+through), `serve-smoke` (every server route, including crash-resume), `archgate` (short greedy generations on five
 architectures: dense, gated delta-net, sparse MoE, hyper-connections + MLA; run with
 each streamer lever on and off), `clonegate` (a fresh clone from the remote builds and
 passes its tests -- a submodule pin that existed only locally once built everywhere
@@ -184,33 +203,36 @@ drive. Growing the ring beyond its default buys nothing: it is consumer-limited.
   ggml runs the graph node by node with a full synchronise after each claimed node.
   The default claims every node -- the only shape proven on every architecture --
   and pays for it; `DRAY_FAST_NODES=1` claims only nodes that can reach streamed
-  memory (11-15%, see Correctness). The cost vanishes into disk time once a model
+  memory (11-15%, measured before the pool fix below; see Correctness). The cost vanishes into disk time once a model
   streams more than a few GB per token.
 - **Thread oversubscription.** ggml's pool spin-waits; with the engine's own threads
   on top, requesting all 22 threads ran about 40x slower. The pool is clamped to
   (cores - 9); decode defaults to 4 threads, prefill to the clamp.
-- **Decode threads: more is slower on small-active models.** Decode s/token by
-  thread count (CPU build, High performance plan, interleaved 4-3-2-1-1-2-3-4):
+- **One thread pool, not one per node.** Until 2026-10-05 every CPU run built and
+  joined a fresh ggml thread pool for each claimed node: without `--gpu` the engine
+  listed the CPU as an offload device, llama created a second CPU backend for it,
+  and the scheduler ran every node there -- a backend that never received the
+  persistent pools. A CPU-sample trace of 48 testbed tokens counted 73,372 thread
+  starts in 22 s. Fixed (an empty device list), same machine, interleaved, text
+  identical:
 
-  | model | 1 | 2 | 3 | 4 |
-  |---|---|---|---|---|
-  | 1B-7B testbed, 8 GiB | 0.107 | 0.166 | 0.200 | 0.235 |
-  | Qwen3.6 35B-A3B, 12 GiB | 0.31 | 0.43-0.54 | | 0.67-0.80 |
-  | Qwen3.8-27B dense, 16 GiB | 1.51 | 1.29 | 1.27 | 1.28 |
-  | Kimi K3, 9 GiB | 11.6 | 9.6 | 9.3 | 9.1 |
+  | model | before | after |
+  |---|---|---|
+  | 1B-7B testbed, 2 GiB, 4 threads | 2.4-3.0 tok/s | 4.9-5.3 tok/s |
+  | Qwen3.6 35B-A3B, 12 GiB, 4 threads | 0.5-1.1 tok/s | 3.7-4.1 tok/s |
+  | Qwen3.6 35B-A3B, 12 GiB, 1 thread | 2.5-2.9 tok/s | 2.7-3.0 tok/s |
 
-  The default of 4 is the slowest choice on the two small-active models and the
-  right one on K3. The cost is ggml's own compute of each claimed node (35B, 40
-  tokens: 62 vs 184 us per node on 1 vs 4 threads, the engine's callbacks
-  unchanged): one node is too little work to pay for waking and joining a pool.
-  Not the cause, measured: thread creation (a persistent pool, attached as stock
-  llama.cpp does, changes nothing), the pool's polling level, pinning to
-  performance cores, `DRAY_FAST_NODES`. The best count depends on the model's work
-  per node on a given machine; `threads.decode` is a machine setting today.
+  The earlier finding that one decode thread beat four on small-active models was
+  this bug (more threads meant more threads created per node); with the pool in
+  effect four threads win again, and the default stays 4. ggml's default polling
+  is kept: workers that sleep instead were faster on a quiet machine and half
+  speed on a loaded one.
 - **Resident mode.** When the whole model fits the cap, llama.cpp allocates it
-  natively. It is correct and much faster than streaming the same model, but still
-  21-46% slower than stock llama.cpp (see the README table); if a model fits, use
-  llama.cpp. `--force-stream` pins the streaming path, and every gate uses it.
+  natively. It is correct and much faster than streaming the same model. It measured
+  21-46% slower than stock llama.cpp, but that was before the thread-pool fix above,
+  which also let it reach llama's repacked kernels for the first time (the same
+  duplicate backend had kept every layer in a plain buffer); to be re-measured. If a
+  model fits, use llama.cpp. `--force-stream` pins the streaming path, and every gate uses it.
 - **For sparse models the disk is free.** Qwen3.5-122B-A10B runs at 2.7 s/token
   reading 872 MiB per token at 12 GiB and at 2.7 s/token reading nothing at 56 GiB.
   Cost tracks active bytes per token, not parameter count; below roughly a gigabyte
@@ -221,7 +243,8 @@ drive. Growing the ring beyond its default buys nothing: it is consumer-limited.
 ## GPU (`--gpu`, opt-in at build and run time)
 
 The GPU is used for prefill only: weights stay in host memory, the KV cache stays in
-RAM, and ggml offloads only large-batch ops, so decode stays on the CPU.
+RAM, and decode stays on the CPU (llama turns op offload off for a batch in which
+every token is from a different sequence).
 
 - **Streamed `--gpu` computed on garbage until 2026-09-30.** ggml's scheduler copies a
   GPU split's weights straight from host memory *before* the eval callback that
@@ -266,7 +289,14 @@ RAM, and ggml offloads only large-batch ops, so decode stays on the CPU.
   decode 25-30% (Flash Next: 1.83 vs 2.23 s/token, same bytes; not power, buffers or
   I/O -- the same work takes more CPU time). Vulkan is a build-time opt-in, and a
   Vulkan build without `--gpu` now disables it for its own process before any ggml
-  call. With `--gpu`, decode still pays it (open).
+  call.
+- **`--gpu` decode no longer goes to the GPU and back.** Until 2026-10-05 a one-token
+  per-head norm in every gated-deltanet layer had 32 rows, which Vulkan's offload
+  rule reads as a batch; with host weights it went to the GPU and back in every such
+  layer of every token (Qwen3.6-35B-A3B: 61 graph splits per decode token, 14.5% of
+  the main thread waiting on fences). The fork now turns op offload off for decode
+  batches. 35B, 12 GiB: `--gpu` decode 2.9-3.0 -> 3.7-4.2 tok/s, against 3.6-3.9
+  without `--gpu`; text identical; a 1852-token prefill still offloads.
 
 ---
 
@@ -290,10 +320,15 @@ distinct prompts, decode bytes only (full table in the README):
   widths the table does not list are unmeasured, not extrapolated.
 - **Joint batched prefill** cut prefill bytes 40% at width 32 on K3.
 - **Cohort rotation** (`--rotate`, opt-in) serves more prompts than the cap funds by
-  running cohorts to completion, parking state to a directory the user chooses; it is
-  the engine's only sustained-write feature and reports its write bytes.
-  Mid-generation parking is still refused until it has its own gate, although
-  per-sequence state restore has since measured bit-exact (attention and recurrent).
+  rotating cohorts, parking state to a directory the user chooses; it is the engine's
+  only sustained-write feature and reports its write bytes. A span shorter than the
+  generation parks sequences mid-generation and resumes them later. That was refused
+  while identical reruns diverged; restore has since measured bit-exact, and
+  `scripts/rotategate.ps1` now requires parked runs to match running straight through,
+  token for token: six prompts at width 2, parked every 4 tokens, again, and every 5,
+  on the 1B-7B testbed (attention, 0.035 GB parked per run) and Qwen3.8-27B
+  (recurrent, 2.84 GB). A restore that flips the sign of ~1000 cached values runs
+  without error and changes one sequence at its 15th token; the gate fails it.
 
 **Serving.** `serve` runs a continuous-batching scheduler: `serve.max_parallel` slots,
 each with its own KV funded at load inside the cap, one decode step carrying every
@@ -372,11 +407,6 @@ measured per model, not assumed. `--kv q4` does not work on Kimi K3 at all
   restart.
 - A VRAM pool for per-sequence state would move the batch-width bound off RAM.
 - Metal needs windowed materialisation to reach its measured 4.1x MoE prefill.
-- With `--gpu`, decode is about 30% slower than without (the same CPU work takes more
-  CPU time once Vulkan is initialised): ~27% at every thread count, in-process only
-  (a separate process holding Vulkan costs ~2%). The cause needs a CPU profile.
-- The right `threads.decode` is model-dependent (1 on small-active models, 4 on K3);
-  one machine-wide default cannot be right for both.
 - GPU prefill still runs one split per host-resident weight, each synchronised;
   grouping weights per split under the VRAM limit is the next lever.
 

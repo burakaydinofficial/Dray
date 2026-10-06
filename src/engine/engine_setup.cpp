@@ -254,15 +254,19 @@ bool Engine::load_model(const EngineConfig& cfg, bool gpu_consent, std::string* 
         mp.tensor_buft_overrides = load_->buft_overrides;
     }
 
-    // Without runtime consent, restrict llama to CPU devices -- a
+    // Without runtime consent, give llama NO offload devices -- a
     // backend-carrying binary must never engage a GPU by surprise.
+    //
+    // An EMPTY list, not one holding the CPU device. llama treats every listed
+    // device as an offload device and creates a backend for it IN ADDITION to
+    // its own CPU backend; the scheduler then ran every node on that duplicate,
+    // which never received the attached thread pools (attach_threadpools), so
+    // ggml built and joined a disposable pool per claimed node: 73,372 threads
+    // in 22 s of testbed decode. Measured 2026-10-05: testbed decode 2.6 -> 5.0
+    // tok/s, process CPU 83 -> 49 s, text identical.
     if (!gpu_consent) {
-        auto& devs = load_->cpu_devices;
+        auto& devs = load_->offload_devices;
         devs.clear();
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            ggml_backend_dev_t d = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) devs.push_back(d);
-        }
         devs.push_back(nullptr);
         mp.devices = devs.data();
     }
@@ -452,15 +456,32 @@ bool Engine::admit(const EngineConfig& cfg, std::string* err) {
 
     const uint32_t n_seq = sequences(cfg);
     const uint64_t need = streamer_->largest_streamed_bytes();
-    const uint64_t have = streamer_->rebudget_against_rss(worst);
+    uint64_t have = streamer_->rebudget_against_rss(worst);
     // The batch working set is admission's problem too, bounded by MEASURED
     // lines only: below 1x the widest union region the run certainly dies
     // mid-step (B=38, budget 0.71x, died); at 2x it ran clean (B=32).
     const uint64_t region = streamer_->batch_region_bytes();
+
+    // RAM is a quality dial, never a gate: before refusing, the read-ahead ring
+    // gives its arena back. It only overlaps reads with compute (every gate also
+    // runs without it), so a cap that cannot hold the widest whole tensor beside
+    // it runs slower instead of not at all. Measured: K3 at 5 GiB was refused,
+    // 891 MiB of cache against output.weight's 918, with a 640 MiB ring.
+    uint64_t ring_freed = 0;
+    if (need > have || (n_seq > 1 && region > have)) {
+        ring_freed = streamer_->yield_ring();
+        if (ring_freed) {
+            // The arena decommits on free: measure again rather than subtract.
+            const uint64_t now = std::max<uint64_t>(mem::Accountant::process_rss(),
+                                                    mem::Accountant::process_committed());
+            have = streamer_->rebudget_against_rss(now);
+        }
+    }
+    const std::string ring_note = ring_freed ? " (read-ahead ring already off)" : "";
     if (n_seq > 1 && region > have) {
         const uint64_t suggest = cfg.cap + (region - have);
         *err = "REFUSED: cap leaves " + std::to_string(have >> 20) +
-               " MiB of cache but one batch-" + std::to_string(n_seq) +
+               " MiB of cache" + ring_note + " but one batch-" + std::to_string(n_seq) +
                " union region needs " + std::to_string(region >> 20) +
                " MiB; lower --batch or try --cap " +
                std::to_string((unsigned long long)std::ceil(
@@ -480,12 +501,18 @@ bool Engine::admit(const EngineConfig& cfg, std::string* err) {
         // S36: one unit family per message. --cap parses bare G as GiB, so the
         // figures here are MiB/GiB (binary) throughout.
         *err = "REFUSED: cap leaves " + std::to_string(have >> 20) +
-               " MiB of cache but " + streamer_->largest_streamed_name() +
+               " MiB of cache" + ring_note + " but " + streamer_->largest_streamed_name() +
                " needs " + std::to_string(need >> 20) +
                " MiB whole; try --cap " +
                std::to_string((unsigned long long)std::ceil(
                    static_cast<double>(suggest) / (1024.0 * 1024 * 1024))) + "G";
         return false;
+    }
+    if (ring_freed) {
+        std::fprintf(stderr,
+                     "[dray] read-ahead ring off: this cap cannot fund it beside what one node "
+                     "needs; its %llu MiB went to the cache (%llu MiB now). Output is unchanged.\n",
+                     (unsigned long long)(ring_freed >> 20), (unsigned long long)(have >> 20));
     }
     return true;
 }
@@ -622,10 +649,12 @@ namespace dray::engine {
 
 // Persistent CPU thread pools, as stock llama.cpp's tools attach them. Without one
 // ggml_graph_compute builds a disposable pool per call (creating and joining
-// n_threads-1 OS threads), and the streamer makes one call per claimed node. NOTE:
-// measured, this did NOT change decode speed (35B: 0.31/0.52/0.78 s/token at 1/2/4
-// threads either way, polling level irrelevant) -- the per-node cost of threaded
-// execution lies elsewhere (DECISIONS 2026-10-01); kept because it is the stock shape.
+// n_threads-1 OS threads), and the streamer makes one call per claimed node.
+// The 2026-10-01 measurement that found "no change" ran with the pools never in
+// effect -- a duplicate CPU backend took every node (see the device list in
+// load_model); with them in effect testbed decode doubled. ggml's default poll
+// level is kept: poll 0 (workers sleep) was faster on a quiet machine and
+// collapsed to half speed on a loaded one.
 void Engine::attach_threadpools(int n_decode, int n_prefill) {
     if (!lctx_ || n_decode <= 0) return;
     ggml_threadpool_params pd = ggml_threadpool_params_default(n_decode);

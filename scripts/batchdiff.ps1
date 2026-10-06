@@ -41,16 +41,16 @@ function SeqTexts([string]$path) {
 }
 
 $f1 = Join-Path $out "on.txt"
-& $bin batch -m $Model --cap $Cap --force-stream --ctx 512 --batch $Batch -n $Tokens -p $Prompt *> $f1
+& $bin batch -m $Model --cap $Cap --force-stream --ctx 512 --batch $Batch -n $Tokens -p $Prompt > $f1 2> "$f1.err"   # texts parse from stdout alone
 if ($LASTEXITCODE -ne 0) { Write-Host "*** batch (compact on) exited $LASTEXITCODE -- VOID ***"; exit 3 }
-if (Select-String -Path $f1 -Pattern "NOT TRUSTWORTHY|CAP BREACH" -Quiet) { Write-Host "*** compact-on leg TAINTED -- VOID ***"; exit 3 }
+if (Select-String -Path $f1, "$f1.err" -Pattern "NOT TRUSTWORTHY|CAP BREACH" -Quiet) { Write-Host "*** compact-on leg TAINTED -- VOID ***"; exit 3 }
 $env:DRAY_NO_COMPACT = '1'
 $f2 = Join-Path $out "off.txt"
-& $bin batch -m $Model --cap $Cap --force-stream --ctx 512 --batch $Batch -n $Tokens -p $Prompt *> $f2
+& $bin batch -m $Model --cap $Cap --force-stream --ctx 512 --batch $Batch -n $Tokens -p $Prompt > $f2 2> "$f2.err"
 $code2 = $LASTEXITCODE
 Remove-Item Env:\DRAY_NO_COMPACT -ErrorAction SilentlyContinue
 if ($code2 -ne 0) { Write-Host "*** batch (compact off) exited $code2 -- VOID ***"; exit 3 }
-if (Select-String -Path $f2 -Pattern "NOT TRUSTWORTHY|CAP BREACH" -Quiet) { Write-Host "*** compact-off leg TAINTED -- VOID ***"; exit 3 }
+if (Select-String -Path $f2, "$f2.err" -Pattern "NOT TRUSTWORTHY|CAP BREACH" -Quiet) { Write-Host "*** compact-off leg TAINTED -- VOID ***"; exit 3 }
 
 $on = SeqTexts $f1
 $off = SeqTexts $f2
