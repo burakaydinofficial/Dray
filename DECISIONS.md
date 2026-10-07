@@ -57,8 +57,18 @@ whole rather than patched row by row.
 **Since then (2026-10-05).** Every CPU run had built a ggml thread pool per graph
 node (see Compute); with that fixed the testbed decodes about 2x faster and
 Qwen3.6 35B-A3B about 4x, and `--gpu` decode no longer trails the CPU (see GPU).
-K3's minimum cap is 5 GiB (see Memory). K3's speed after the thread-pool fix has
-not been measured yet: that needs a quiet machine.
+K3's minimum cap is 5 GiB (see Memory).
+
+**Re-measured on an idle machine (2026-10-06).** The README's tables were all
+re-run (two passes, High performance plan). K3 at 9 GiB, decode only (a 32-token
+run minus a 2-token run): 50.6 GB per token at 8.3 s/token, 6.1 GB/s -- the drive's
+calibrated 2 MiB random-read ceiling. On K3 the drive is the limit, as designed; on
+the sparse models compute is, with the disk adding about 13% (Qwen3.6 35B-A3B
+streaming at 3 vs 28 GiB: 2.6 vs 3.0 tok/s). Resident mode matches stock llama.cpp
+at the same thread count (35B 10.4 vs 10.40 tok/s, 27B 1.9 vs 1.88; stock at its
+default 16 threads is 17-32% faster). More decode threads help resident runs (8 is
+best on the 35B) but not streaming ones (the 35B streams faster at 4), so the
+default stays 4.
 
 ---
 
@@ -229,12 +239,18 @@ drive. Growing the ring beyond its default buys nothing: it is consumer-limited.
   speed on a loaded one.
 - **Resident mode.** When the whole model fits the cap, llama.cpp allocates it
   natively. It is correct and much faster than streaming the same model. It measured
-  21-46% slower than stock llama.cpp, but that was before the thread-pool fix above,
-  which also let it reach llama's repacked kernels for the first time (the same
-  duplicate backend had kept every layer in a plain buffer); to be re-measured. If a
-  model fits, use llama.cpp. `--force-stream` pins the streaming path, and every gate uses it.
-- **For sparse models the disk is free.** Qwen3.5-122B-A10B runs at 2.7 s/token
-  reading 872 MiB per token at 12 GiB and at 2.7 s/token reading nothing at 56 GiB.
+  21-46% slower than stock llama.cpp until the thread-pool fix above, which also let it
+  reach llama's repacked kernels for the first time (the same duplicate backend had
+  kept every layer in a plain buffer). Re-measured 2026-10-06 against llama-bench
+  built from the same llama.cpp commit: equal at 4 threads (Qwen3.6 35B-A3B 10.4 vs
+  10.40 tok/s, Qwen3.8-27B 1.9 vs 1.88); stock at its default 16 threads is 17-32%
+  faster. If a model fits, use llama.cpp. `--force-stream` pins the streaming path,
+  and every gate uses it.
+- **For sparse models the disk is nearly free.** Qwen3.6 35B-A3B streaming at 3 GiB
+  reads about 420 MB per token more than at 28 GiB and decodes at 2.6 vs 3.0 tok/s
+  (2026-10-06): the drive adds about 13%. Before the thread-pool fix compute was slow
+  enough to hide it completely (Qwen3.5-122B-A10B: 2.7 s/token reading 872 MiB per
+  token at 12 GiB or nothing at 56 GiB).
   Cost tracks active bytes per token, not parameter count; below roughly a gigabyte
   per token, compute is the limit.
 

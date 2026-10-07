@@ -39,9 +39,9 @@ GB/token (0 bytes at 28 GiB, fully resident), 122B-A10B 0.406, DeepSeek 0.892.
 The 122B clears width 96 on 28 GiB. The --gpu prefill figures of 2026-08
 (22 seconds for a 6,594-token prompt, 12-72x) are WITHDRAWN: streamed --gpu
 computed on poison until 2026-09-30 (DECISIONS; gated by gpugate). Resident mode (opt-out, when the
-model fits the cap) is correct; it measured 21-46% SLOWER than stock llama.cpp (2026-08-24),
-but that was before the 10-05 fixes (a disposable thread pool per node on every CPU run, and
-resident never reaching the repacked kernels) -- re-measure before quoting. If a model fits, use llama.cpp. --force-stream pins the
+model fits the cap) is correct and, since the 10-05 fixes, matches stock llama.cpp at the same
+thread count (35B 10.4 vs 10.40 tok/s, 27B 1.9 vs 1.88); stock at its default 16 threads is
+still 17-32% faster (2026-10-06). If a model fits, use llama.cpp. --force-stream pins the
 streaming path and every gate uses it.
 
 Correctness is sealed on Windows/Linux/macOS at identical node counts; the

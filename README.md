@@ -14,101 +14,99 @@ class, and tells you whether the engine or the disk is the limit.
 
 ## When NOT to use this
 
-If the model fits in your RAM, use llama.cpp. It is FASTER than we are there,
-measured on this machine with load excluded from both sides (our windowed
-steady-state against llama-bench generation):
+If the model fits in your RAM, use llama.cpp. Measured 2026-10-06 on this machine,
+both built from the same llama.cpp commit, load excluded from both sides (our
+windowed decode rate against llama-bench tg32):
 
-| model | dray resident | stock llama.cpp | stock is |
+| model | dray resident | stock llama.cpp, same 4 threads | stock at its default 16 threads |
 |---|---|---|---|
-| Qwen3.6 35B-A3B | 7.5 tok/s | 9.1 | 21% faster |
-| Qwen3.5 122B-A10B | 2.7 tok/s | 3.35 | 24% faster |
-| Qwen3.8-27B dense | 1.2 tok/s | 1.75 | 46% faster |
+| Qwen3.6 35B-A3B | 10.4 tok/s | 10.40 | 12.20 |
+| Qwen3.8-27B dense | 1.9 tok/s | 1.88 | 2.51 |
 
-An earlier version of this file called that parity. It is not parity, and the
-claim was made by waving at load overhead instead of measuring the windowed
-rate. When the model fits, you gain a memory cap you do not need and pay 20 to
-45% for it.
-
-> **These three rows predate two fixes (2026-10-05) and must be re-measured.**
-> Every CPU run built and joined a fresh ggml thread pool per graph node (a
-> duplicate CPU backend never received the persistent pool), and resident mode
-> never reached llama's repacked kernels for the same reason. Fixed, the testbed
-> decodes about 2x faster and Qwen3.6 35B-A3B about 4x (streaming, 12 GiB) --
-> before and after interleaved on one machine, ranges far apart. The absolute
-> figures above need a quiet machine, which that day was not, so they stand
-> unchanged until re-run.
+At the same thread count resident mode now matches stock. Stock at its own default
+is still faster, by 17% and 32%; our best on the 35B is 11.4 tok/s at 8 threads,
+still behind. When the model fits, you gain a memory cap you do not need and give
+up that margin. (Until 2026-10-05 the gap was 21-46% at stock's settings: every CPU
+run here built a fresh thread pool per graph node, and resident mode never reached
+llama's repacked kernels. Both are fixed.)
 
 This engine earns its keep on ONE thing: models that do not fit. A 594 GB
-checkpoint under an 8 GiB cap is not slower elsewhere, it is impossible
-elsewhere. When the model does not fit, the streaming path costs roughly 2x
-what resident allocation would (a thread-pool barrier per intercepted graph
-node, which is the price of repointing weights mid-forward-pass), and that
-penalty disappears into disk time as soon as a configuration streams more than
-a few GB per token -- K3 at ~16 s/token spends about 2 of those seconds
-computing.
+checkpoint under a 5 GiB cap is not slower elsewhere, it is impossible
+elsewhere. When the model does not fit, the streaming path costs more compute
+than resident allocation would (a thread-pool barrier per intercepted graph node,
+which is the price of repointing weights mid-forward-pass), and that penalty
+disappears into disk time as soon as a configuration streams more than a few GB
+per token.
 
 The rule: does it fit? Use llama.cpp. Does it not fit? That is what this is.
 
 ## A surprise worth knowing before you buy a faster drive
 
-For sparse models the DISK IS FREE. Measured on Qwen3.5-122B-A10B with the
-streaming path pinned in both legs: at a 12 GiB cap it reads 872 MiB per token
-and runs at 2.7 s/token; at 56 GiB it reads NOTHING and runs at 2.7 s/token.
-Identical. The 35B-A3B behaves the same way (479 MiB/token at 6 GiB, zero at 28
-GiB, 1.6 s/token both). The drive is entirely hidden behind compute.
+For sparse models the disk is nearly free. Qwen3.6 35B-A3B with the streaming path
+pinned in both legs (2026-10-06): at a 3 GiB cap it reads about 420 MB per token
+more than at 28 GiB, and decodes at 2.6 tok/s against 3.0. The drive adds about
+13%; compute is the rest. (Before the 2026-10-05 thread-pool fix, compute was slow
+enough to hide the drive completely: Qwen3.5-122B-A10B ran at 2.7 s/token reading
+872 MiB per token or nothing.)
 
 So the cost model this project is built on -- misses x bytes / bandwidth -- is
 right in shape for Kimi K3 and wrong for anything moving under a gigabyte per
 token. Below some byte rate the engine is the limit and the SSD is idle
 capacity you already paid for. If your model is in that regime, a faster drive
-buys nothing.
+buys little.
 
-On the large models the drive IS now the limit, which is where it should be.
-Calibrated on Kimi K3's own fourteen shards this NVMe serves 2 MiB random reads
-at 6.03 GB/s. Until late September the engine achieved 1.8, because the thread
-that submitted and collected reads was the thread that computed; a dedicated I/O
-thread, expert reads that land in place, and reuse of expert memory brought K3
-at a 9 GiB cap to about 5.9 GB/s. DECISIONS.md has the steps and the
-measurements; the table below predates them and will be re-measured whole.
+ON THE LARGE MODELS THE DRIVE IS THE LIMIT, as it should be. Calibrated on Kimi
+K3's own fourteen shards this NVMe serves 2 MiB random reads at 6.03 GB/s. At a
+9 GiB cap K3 reads 50.6 GB per decode token at 8.3 s/token (2026-10-06, 30 tokens,
+load and prompt excluded): 6.1 GB/s, the drive's measured ceiling. In August the
+engine reached 1.8 GB/s, because reads only progressed between compute nodes; an
+I/O thread has owned the device since 2026-09-26 (DECISIONS). Here more RAM (fewer
+bytes per token) or a faster drive is what buys speed.
 
-## Measured status (2026-08-23)
+## Measured status (2026-10-06)
 
-Every number below was measured on the machine described in DECISIONS.md, the
-lab notebook this repository carries; the per-cell data is in
-`scripts/matrix-results.csv`.
+Re-measured on 2026-10-06 after the 10-05 fixes (a thread pool per graph node on
+every CPU run; see DECISIONS.md), two full passes on an otherwise idle machine,
+High performance power plan. Both passes are shown; where they agree, one value.
 
-| model | disk | cap | decode | bytes/token |
+| model | disk | cap | decode (pass 1 / pass 2) | projected bytes/token |
 |---|---|---|---|---|
-| Qwen3.6 35B-A3B | 21 GB | **3 GiB** | 1.9 s/token | 575 MiB |
-| Qwen3.6 35B-A3B | 21 GB | 8 GiB | 1.7 s/token | 415 MiB |
-| Qwen3.6 35B-A3B | 21 GB | 28 GiB | 5.7 tok/s | 0 (resident) |
-| Qwen3.5 122B-A10B | 39 GB | **3 GiB** | 2.6 s/token | 2.50 GiB |
-| Qwen3.5 122B-A10B | 39 GB | 12 GiB | 2.3 s/token | 872 MiB |
-| Qwen3.5 122B-A10B | 39 GB | 28 GiB | 2.6 s/token | 360 MiB |
-| DeepSeek V4 Flash 284B | 90 GB | **3 GiB** | 4.6 s/token | 5.80 GiB |
-| DeepSeek V4 Flash 284B | 90 GB | 8 GiB | 3.9 s/token | 1.93 GiB |
-| DeepSeek V4 Flash 284B | 90 GB | 24 GiB | 3.8 s/token | 1.56 GiB |
-| Qwen3.8-27B dense | 16 GB | **4 GiB** | 3.3 s/token | 12.74 GiB |
-| Qwen3.8-27B dense | 16 GB | 8 GiB | 2.6 s/token | 8.74 GiB |
-| Qwen3.8-27B dense | 16 GB | 20 GiB | 1.2 tok/s | 0 (resident) |
-| MiniMax-M3 429B | 143 GB | 8 GiB | 6.8 s/token | 4.77 GiB |
-| MiniMax-M3 429B | 143 GB | 28 GiB | 5.3 s/token | 3.30 GiB |
-| GLM-5.2 744B | 217 GB | 8 GiB | 8.6 s/token | 12.80 GiB |
-| GLM-5.2 744B | 217 GB | 28 GiB | 8.3 s/token | 5.45 GiB |
-| Kimi K3 2.8T | 594 GB | 9 GiB | 25.8 s/token (22.7 over 32 tokens) | 46.22 GiB |
-| Kimi K3 2.8T | 594 GB | 28 GiB | 24.3 s/token | 27.22 GiB |
+| Qwen3.6 35B-A3B | 21 GB | **3 GiB** | 2.8 tok/s | 559 MiB |
+| Qwen3.6 35B-A3B | 21 GB | 8 GiB | 2.9 / 3.1 tok/s | 399 MiB |
+| Qwen3.6 35B-A3B | 21 GB | 28 GiB | 7.3 / 8.1 tok/s | 0 (resident) |
+| DeepSeek V4 Flash 284B | 90 GB | **3 GiB** | 1.5 s/token | 5.46 GiB |
+| DeepSeek V4 Flash 284B | 90 GB | 8 GiB | 1.0 tok/s | 1.92 GiB |
+| DeepSeek V4 Flash 284B | 90 GB | 24 GiB | 1.0 / 1.1 tok/s | 1.55 GiB |
+| Qwen3.8-27B dense | 16 GB | **4 GiB** | 2.4 s/token | 12.07 GiB |
+| Qwen3.8-27B dense | 16 GB | 8 GiB | 2.0 s/token | 8.07 GiB |
+| Qwen3.8-27B dense | 16 GB | 20 GiB | 1.6 / 1.7 tok/s | 0 (resident) |
+| MiniMax-M3 429B | 143 GB | 8 GiB | 1.9 / 2.0 s/token | 3.98 GiB |
+| MiniMax-M3 429B | 143 GB | 28 GiB | 1.5 s/token | 3.27 GiB |
+| Kimi K3 2.8T | 594 GB | **5 GiB** | 27.4 s/token (see below) | 49.32 GiB |
+| Kimi K3 2.8T | 594 GB | 9 GiB | 9.8 / 9.9 s/token | 45.32 GiB |
+| Kimi K3 2.8T | 594 GB | 28 GiB | 7.7 s/token | 26.32 GiB |
 
-Bold caps are the measured minimum that still produces correct text. Kimi K3's
-minimum is now **5 GiB** (2026-10-05, this build): correct text over 32 tokens at
-4k context, 4.6 GB resident, about 56 GB read per token. At that cap the
-read-ahead ring gives its memory to the cache, and the run says so. Its speed
-was not measured: the machine was shared, and a timing taken that way would be
-noise. All other rows:
-4k context, CPU only, `--kv q4` (K3 uses f16, the only setting it accepts), 32
-generated tokens, one methodology and one build. Reproduce with
-`scripts/matrix.ps1`; every cell including 32k context and GPU is in
-`scripts/matrix-results.csv`. Earlier versions of this table mixed figures taken
-from different builds and prompts, which is why several rows moved.
+All rows: 4k context, CPU only, `--kv q4` (K3 uses f16, the only setting it
+accepts), 32 generated tokens, one build. "Decode" is the run's own mean rate
+including the short prompt. Bold caps are the smallest measured that produce correct
+text; some may now run lower (the read-ahead ring yields to a tight cap since
+2026-10-05) and have not been probed. Reproduce with `scripts/matrix.ps1 -GpuModes
+off -Contexts 4096`.
+
+**Bytes/token is the planner's projection** for that cap (the `plan` output), which
+assumes perfect eviction; measured traffic is higher. K3 at 5 GiB projects 49.3 GiB
+and measured 1,860 GB over the prompt and 32 tokens, 52-54 GiB per forward pass.
+
+**K3 at 5 GiB** is the floor since 2026-10-05: the read-ahead ring gives its memory
+to the cache, and the run says so; 4.6 GB resident. Five of six runs completed with
+correct text (26.9-27.4 s/token); one exited with an error after generating text,
+and that run's log was not kept -- the harness now keeps every failed run's output.
+
+Against the previous table (2026-08-23, Balanced plan, older build): the 35B at 3 GiB
+went from 1.9 s/token to 2.8 tok/s, DeepSeek at 8 GiB from 3.9 s/token to 1.0 tok/s,
+MiniMax-M3 at 8 GiB from 6.8 to 1.9 s/token, and K3 at 9 GiB from 25.8 to 9.8
+s/token. The Qwen3.5 122B-A10B and GLM-5.2 rows of that table are not repeated: those
+models are no longer on this machine.
 
 **Prefill is a different workload**, and `--gpu` exists for it.
 
@@ -122,18 +120,22 @@ from different builds and prompts, which is why several rows moved.
 > `scripts/gpugate.ps1` now proves `--gpu` bit-identical to llama.cpp's own GPU
 > path on every architecture that fits resident here.
 >
-> Corrected figures so far (2026-10-01, High performance plan, a 2.3k-token
-> prompt, defaults: the automatic 1.94 GiB VRAM limit chooses the chunk).
-> Seconds until generation starts, both including ~5 s of load:
+> Measured 2026-10-06 (High performance plan, idle machine, 8k context), on a fixed
+> 3,264-token prompt -- the first 9,000 characters of this README as of 2026-10-01 --
+> with defaults: the automatic 1.94 GiB VRAM limit chooses the chunk. Seconds until
+> generation starts, both including ~5 s of load:
 >
 > | model | cap | CPU | `--gpu` | GB read CPU / GPU |
 > |---|---|---|---|---|
-> | Qwen3.6 35B-A3B | 12 GiB | 133.9 | **16.8** (1024-token chunks) | 105.6 / 66.6 |
-> | Qwen3.8-27B dense | 16 GiB | 707.1 | **33.4 / 32.3** (512-token chunks) | 54.5 / 71.1 |
+> | Qwen3.6 35B-A3B | 12 GiB | 106.1 / 106.7 | **36.9-42.6** (1024-token chunks) | 100.4 / 62.2 |
+> | Qwen3.8-27B dense | 16 GiB | 553.3 | **47.6 / 49.5** (512-token chunks) | 35.1 / 43.8 |
 >
 > The dense model's GPU path reads more: every weight is copied per chunk, while
-> the CPU path keeps part of the model cached. The other models will be
-> re-measured before this table grows.
+> the CPU path keeps part of the model cached. The 2026-10-01 figures this replaces
+> (CPU 133.9 and 707.1 s, GPU 16.8 and 33 s) were taken on a shorter prompt -- that
+> day's README -- and the CPU ones with a fresh thread pool per graph node; they are
+> withdrawn rather than compared. On this prompt the 2026-10-01 build takes 55-56 s
+> for the 35B with `--gpu`, the current one 37-43 s.
 
 GPU decode LOSES on every model measured, in all fifteen comparable pairs, so
 `--gpu` is worth flipping for prompt-heavy work and not otherwise. It also

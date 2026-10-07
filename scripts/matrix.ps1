@@ -24,12 +24,15 @@ param(
     [string]$Only = "",          # substring filter on model name
     [switch]$Force,              # re-run cells already in the CSV
     [int]$DecodeTokens = 32,
-    [string]$PrefillFile = ""    # defaults to the 6,594-token prompt
+    [string]$PrefillFile = "",   # defaults to the 6,594-token prompt
+    [string[]]$GpuModes = @("off", "on"),   # which --gpu settings to run
+    [int[]]$Contexts = @(),        # restrict to these contexts (default: each model's list)
+    [string]$ResultsCsv = ""       # results file (default scripts/matrix-results.csv)
 )
 $ErrorActionPreference = "Continue"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $bin  = Join-Path $root "build\dray\bin\dray.exe"
-$csv  = Join-Path $PSScriptRoot "matrix-results.csv"
+$csv  = if ($ResultsCsv) { $ResultsCsv } else { Join-Path $PSScriptRoot "matrix-results.csv" }
 if (-not $PrefillFile) { $PrefillFile = Join-Path $root "build\prompt_8000tok.txt" }
 # Refuse to produce a results file at all if the inputs are missing. A missing
 # binary or prompt file used to write a full column of "the engine refused"
@@ -57,7 +60,7 @@ $models = @(
   @{ n="glm-5.2-744b";     p="D:\Models\unsloth\GLM-5.2-GGUF\UD-IQ1_S\GLM-5.2-UD-IQ1_S-00001-of-00006.gguf";
      caps=@("8G","28G"); ctxs=@(4096) },
   @{ n="kimi-k3-2.8t";     p="D:\Models\unsloth\Kimi-K3-GGUF\UD-IQ1_S\Kimi-K3-UD-IQ1_S-00001-of-00014.gguf";
-     caps=@("9G","28G"); ctxs=@(4096); kv="f16" }   # q4 fails: quantised KV forces
+     caps=@("5G","9G","28G"); ctxs=@(4096); kv="f16" }   # q4 fails: quantised KV forces
                                                     # flash attention and K3 cannot
                                                     # create a context with it
 )
@@ -81,7 +84,8 @@ foreach ($mm in $models) {
     if (-not (Test-Path $mm.p)) { Write-Host "$($mm.n): ABSENT, skipped"; continue }
     foreach ($cap in $mm.caps) {
       foreach ($ctx in $mm.ctxs) {
-        foreach ($gpu in @("off","on")) {
+        if ($Contexts.Count -and ($Contexts -notcontains $ctx)) { continue }
+        foreach ($gpu in $GpuModes) {
           $gpuArgs = if ($gpu -eq "on") { @("--gpu") } else { @() }
           $kv = if ($mm.kv) { $mm.kv } else { "q4" }
 
@@ -100,8 +104,14 @@ foreach ($mm in $models) {
                 if ($r) {
                     Emit $mm.n $cap $ctx $gpu "decode" "status" "REFUSED" ($r -replace ',',';')
                 } else {
-                    $tail = ($out | Select-Object -Last 1) -replace ',',';'
-                    Emit $mm.n $cap $ctx $gpu "decode" "status" "FAILED" "exit $LASTEXITCODE : $tail"
+                    # Name the cause and keep the whole run: the last line alone was
+                    # generated text, which once left a K3 failure unexplainable.
+                    $code = $LASTEXITCODE
+                    $why = ($out | Select-String "CAP BREACH|NOT TRUSTWORTHY|FATAL|ERROR|error:" | Select-Object -First 1).Line
+                    if (-not $why) { $why = ($out | Select-Object -Last 1) }
+                    $log = Join-Path (Split-Path $csv) "failed-$($mm.n)-$cap-$ctx-$gpu-decode.log"
+                    $out | Out-File -FilePath $log -Encoding utf8
+                    Emit $mm.n $cap $ctx $gpu "decode" "status" "FAILED" ("exit $code : " + ($why -replace ',',';') + " (log: $(Split-Path $log -Leaf))")
                 }
             } elseif ($out | Select-String "NOT TRUSTWORTHY|CAP BREACH" -Quiet) {
                 # Every correctness gate refuses a tainted run; the harness whose
