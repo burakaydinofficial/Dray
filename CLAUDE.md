@@ -28,7 +28,9 @@ Never report an optimistic figure, never quietly drop a measurement because it l
 Built and measured. NINE models generate correct text through one arch-blind
 planner: the 1B-7B testbed (control), GLM-5.2 744B, Qwen3.8 2.4T, Kimi K3 2.8T,
 MiniMax-M3 429B, Qwen3.8-27B (dense), Qwen3.6 35B-A3B, Qwen3.5 122B-A10B and
-DeepSeek V4 Flash 284B (hyper-connections + MLA).
+DeepSeek V4 Flash 284B (hyper-connections + MLA). Since 2026-10-07 the fork pin is the newer
+llama.cpp base, which adds GLM-5.3 Flash (glm5next) and Qwen3.8-Flash-Next
+(qwen4exp); both are in archgate. GLM-5.2 and the 122B are no longer on this machine.
 
 **The 2026-08-23 headline, which reframes the project:** cost tracks ACTIVE
 bytes per token, not parameter count. Qwen3.6 35B-A3B costs 287 MiB/token at
@@ -281,7 +283,11 @@ evict" moves the number. The fill order above applies *above* the knee, and the 
 cached bytes stay cached holds only there.
 
 **Wall time cannot settle a question this size on this hardware** — the same configuration measures ~10% apart
-run to run. Conclusions come from bytes-read, which is deterministic.
+run to run. Conclusions come from bytes-read, which is deterministic -- and stays so only while no engine
+decision depends on a noisy input. Two did until 2026-10-07 (bytes varied up to 0.06%): the OS-measured
+memory charge (now charged in steps of cap/256, rounded up, never lowered) and a victim chosen by walking a
+hash map keyed by tensor POINTERS (addresses differ per run). Never let a decision iterate a pointer-keyed
+unordered container; use an order the engine itself defines (LRU, graph order, claim order).
 
 ## Working notes
 

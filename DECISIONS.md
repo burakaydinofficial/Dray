@@ -8,7 +8,8 @@ reader who met the old number knows why it moved.
 How to read the numbers:
 
 - **Bytes are the evidence; seconds are supporting.** Bytes read per token are
-  deterministic for a given build, cap and prompt. Wall time on this machine varies
+  deterministic for a given build, cap and prompt (exactly so since 2026-10-07; before
+  that, up to 0.06% noise -- see Corrections). Wall time on this machine varies
   about 10% run to run, so timings are quoted as interleaved runs (A/B/B/A or three
   per build) with the spread shown.
 - **The power plan is part of the measurement.** On the test laptop, Windows
@@ -152,9 +153,10 @@ error. The gates exist because of specific escapes:
 repacked kernels resident mode uses by default are compared and reported, never
 required), `batchdiff` (within-batch identity), `golden` (every command and lever,
 text and counters), `rotategate` (parking mid-generation vs running straight
-through), `serve-smoke` (every server route, including crash-resume), `archgate` (short greedy generations on five
-architectures: dense, gated delta-net, sparse MoE, hyper-connections + MLA; run with
-each streamer lever on and off), `clonegate` (a fresh clone from the remote builds and
+through), `serve-smoke` (every server route, including crash-resume), `archgate` (short greedy generations on six
+architectures: the 1B-7B control, dense gated delta-net, sparse MoE, hyper-connections +
+MLA, GLM-5.3 Flash and Qwen3.8-Flash-Next; run with each streamer lever on and off),
+`clonegate` (a fresh clone from the remote builds and
 passes its tests -- a submodule pin that existed only locally once built everywhere
 except for anyone else). Unit tests cover the I/O scheduler against a scripted fake
 backend, and each new test is checked by injecting the bug it targets.
@@ -279,8 +281,8 @@ every token is from a different sequence).
   prefill figure is withdrawn (see Corrections). Covered (2026-10-06): the 1B-7B
   testbed, Qwen3.8-27B, Qwen3.6 35B-A3B and DeepSeek V4 Flash bit-identical to the
   resident GPU path; Qwen3.8-Flash-Next (too big for a resident reference) runs
-  clean with text identical to the CPU. Flash-Next's architecture is only in the
-  newer llama.cpp base the fork carries on a separate branch, not yet the pinned one.
+  clean with text identical to the CPU. Unchanged on the newer llama.cpp base
+  (2026-10-07, see Platforms).
 - **Copies read only the routed experts.** The scheduler copies only the experts a
   split routes to; the copy now reads only those (whole tensors when every routed
   tensor fits the cache). GPU prefill reads the same bytes as CPU prefill: Qwen3.8
@@ -396,6 +398,19 @@ measured per model, not assumed. `--kv q4` does not work on Kimi K3 at all
   Metal over the streamed weights is correct in whole-tensor mode but not yet faster;
   it needs windowed materialisation.
 - CI builds and tests Windows, macOS, Linux and a ThreadSanitizer job on every push.
+- **The llama.cpp base (2026-10-07).** The vendored fork moved to Unsloth's GLM-5
+  branch of upstream (2026-09-16, six weeks and 658 upstream commits newer) with this
+  engine's nine patches re-applied: 10 files, +359/-32 lines, kept small so each
+  upstream move stays cheap. It adds GLM-5.3 Flash and Qwen3.8-Flash-Next, and
+  replaces the Kimi K3 community code the fork used to carry with upstream's own.
+  Verified: golden identical to the old base on every case and byte count, every gate
+  green, every minimum cap clean (K3 5 GiB, Qwen3.8 2.4T 5, MiniMax-M3 8, GLM-5.3
+  Flash 4, Flash Next 8), speed equal within noise in interleaved runs. Two archgate
+  expectations changed because upstream changed: Qwen3.6 35B-A3B's text with a
+  quantised KV cache (identical across bases with f16; on the new base llama's own
+  allocator produces the same text as the streaming path), and DeepSeek V4 Flash,
+  whose graph upstream rewrote (80,883 -> 79,731 nodes). A stock llama.cpp reference
+  for DeepSeek would need 90 GB mapped on 80 GB of RAM and was not run.
 
 ---
 
@@ -403,14 +418,24 @@ measured per model, not assumed. `--kv q4` does not work on Kimi K3 at all
 
 - **"`--gpu` prefill is 12-72x faster; a 6,594-token prompt takes 22 s"** --
   withdrawn: every streamed `--gpu` run computed on garbage until 2026-09-30 (see
-  GPU). Correct GPU prefill figures are being re-measured.
-- **"Resident mode reaches parity with stock llama.cpp"** -- it does not; stock is
-  21-46% faster when a model fits.
+  GPU). Re-measured on a fixed prompt on 2026-10-06 (README).
+- **"Resident mode reaches parity with stock llama.cpp"** -- first claimed by
+  gesture, then measured 21-46% behind; that gap was mostly a fresh thread pool per
+  graph node and missing repacked kernels. Since 2026-10-06: equal at the same thread
+  count, stock 17-32% ahead at its default 16 threads.
 - **"Kimi K3 runs at 8 GiB at 16.1 s/token, 6 GiB minimum"** -- not reproducible once
-  memory accounting became complete; the minimum is 9 GiB.
+  memory accounting became complete (9 GiB minimum then); since 2026-10-05 the
+  minimum is 5 GiB, for the reasons in Memory.
 - **"Qwen3.8 at 4 GiB"** -- the ledger was not counting everything; the minimum is 5 GiB.
 - **"Node skipping is worth 42%"** -- measured on a broken version; the correct
-  version is worth 11-15%.
+  version was worth 11-15%, and nothing since the thread-pool fix (see Compute).
+- **"Bytes read are deterministic"** -- until 2026-10-07 only to about 0.06% (27B at
+  8 GiB: 334.48-334.53 GB over identical runs). Two engine decisions depended on
+  noise: the memory the ledger cannot explain is measured from the OS and moved the
+  cache budget by a few hundred KB per run (now charged in steps of 1/256 of the cap,
+  rounded up and never lowered), and a demotion picked its victim by walking a hash
+  map keyed by tensor addresses, which differ per run (now the least recently used).
+  Identical runs now match in every counter.
 - **The K3 slowdown after its first published figure** was two things, neither in
   the streamer: the scheduler metadata above (bytes) and the unused Vulkan backend
   compiled in (time).

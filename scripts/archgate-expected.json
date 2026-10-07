@@ -1,6 +1,8 @@
 ﻿{
+    "qwen38-flash-next":  " Paris. The capital of Germany is Berlin",
     "qwen38-27b":  " Paris.\nThe capital of Germany is",
-    "qwen36-35b-a3b":  " Paris, a city renowned for its iconic",
-    "deepseek-v4-flash":  " Paris.\", \"The capital of France is",
+    "qwen36-35b-a3b":  " Paris.\nThe capital of France is",
+    "glm-5.3-flash":  " Paris. Paris is the largest city in",
+    "deepseek-v4-flash":  " Paris. The capital of France is Paris",
     "testbed-1b7b":  " Paris.\n\nThe currency of France"
 }

@@ -224,9 +224,10 @@ ctest --preset dev
 # binary: build/dray/bin/dray (DLLs colocated on Windows)
 ```
 
-C++20, CMake, CPU-only compute by default. llama.cpp is vendored as a pinned submodule
-(the true fork delta is two loader commits, ~47 lines; the rest is an upstream Kimi-K3
-PR that has not merged yet). The dev preset is portable (Windows and macOS); a
+C++20, CMake, CPU-only compute by default. llama.cpp is vendored as a pinned submodule:
+our fork's newer branch, which is Unsloth's GLM-5 branch of upstream
+(2026-09-16) plus nine small patches -- the metadata-only loader, scheduler hooks, a
+repack opt-in and the node budget; 10 files, +359/-32 lines. The dev preset is portable (Windows and macOS); a
 linux preset and untested ARM64 crosses exist beside it.
 `-DDRAY_METAL_BUILD=ON` builds the experimental Metal path, runtime-gated by
 `DRAY_METAL=1`.

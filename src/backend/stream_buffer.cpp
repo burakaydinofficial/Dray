@@ -729,8 +729,21 @@ uint64_t Streamer::rebudget_against_rss(uint64_t rss) {
     //
     // charge_unreserved SETS rather than accumulates, so calling this on a timer
     // tracks the figure instead of compounding it.
+    //
+    // CHARGED IN STEPS, NEVER LOWERED. The OS figure jitters between identical
+    // runs (measured: ~180 KB at load on the 27B), and every decision taken
+    // against the budget -- pinning a tensor, promoting a ring segment -- flipped
+    // near its threshold, so bytes read differed by up to 0.06% run to run. The
+    // charge is rounded UP to a step of 1/256 of the cap (only ever over-charged:
+    // the cap stays honest, at most 0.4% of it set aside) and only ratchets up, so
+    // jitter changes the budget only when it straddles a step boundary.
     const uint64_t explained = im.mem.ledger().used() - im.mem.ledger().unreserved();
-    im.mem.ledger().charge_unreserved(rss > explained ? rss - explained : 0);
+    const uint64_t measured  = rss > explained ? rss - explained : 0;
+    const uint64_t step      = std::max<uint64_t>(im.mem.ledger().cap() / 256, 1);
+    const uint64_t rounded   = (measured + step - 1) / step * step;
+    im.unexplained_measured  = measured;
+    im.unexplained_step      = step;
+    im.mem.ledger().charge_unreserved(std::max(rounded, im.mem.ledger().unreserved()));
 
     // Hand back anything now over the line. Pinned entries are not evictable, so
     // this can fail to reach the target -- report_over_cap() is what tells the user
@@ -749,7 +762,9 @@ std::string Streamer::accountant_report() const {
     if (unres) {
         std::ostringstream o;
         o << "  unreserved (llama.cpp buffers, vocab, allocator overhead)  "
-          << (unres / 1e9) << " GB";
+          << (unres / 1e9) << " GB charged (last measured "
+          << (impl_->unexplained_measured / 1e9) << " GB; charged in steps of "
+          << (impl_->unexplained_step >> 20) << " MiB, rounded up, never lowered)";
         r += std::string("\n") + o.str();
     }
     return r;

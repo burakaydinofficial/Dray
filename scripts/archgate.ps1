@@ -18,7 +18,8 @@
 param(
     [string]$Cap = "12G",
     [int]$Tokens = 8,
-    [switch]$Record          # write current outputs as the new expectations
+    [switch]$Record,         # write current outputs as the new expectations
+    [string]$Only = ""       # substring filter on model name
 )
 $ErrorActionPreference = "Continue"
 $bin = Join-Path $PSScriptRoot "..\build\dray\bin\dray.exe"
@@ -45,7 +46,11 @@ $models = @(
     @{ name = "qwen36-35b-a3b"; why = "sparse MoE, 256 experts top-8";
        path = "D:\Models\unsloth\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf" },
     @{ name = "deepseek-v4-flash"; why = "HYPER-CONNECTIONS + MLA, 256 experts top-6";
-       path = "D:\Models\unsloth\DeepSeek-V4-Flash-0731-GGUF\UD-Q2_K_XL\DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf" }
+       path = "D:\Models\unsloth\DeepSeek-V4-Flash-0731-GGUF\UD-Q2_K_XL\DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf" },
+    @{ name = "glm-5.3-flash"; why = "glm5next, 288 experts top-8 (new base only)";
+       path = "D:\Models\unsloth\GLM-5.3-Flash-GGUF\UD-IQ1_M\GLM-5.3-Flash-UD-IQ1_M-00001-of-00003.gguf" },
+    @{ name = "qwen38-flash-next"; why = "qwen4exp, 512 experts top-10 (new base only)";
+       path = "D:\Models\unsloth\Qwen3.8-Flash-Next-GGUF\UD-Q4_K_XL\Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf" }
 )
 
 $expected = @{}
@@ -59,6 +64,7 @@ $fail = 0; $ran = 0; $skipped = @()
 $results = @{}
 
 foreach ($m in $models) {
+    if ($Only -and $m.name -notlike "*$Only*") { continue }
     if (-not (Test-Path $m.path)) { $skipped += $m.name; continue }
     $f = Join-Path $env:TEMP "archgate-$($m.name).txt"
     # --force-stream is MANDATORY here. Without it, any model that fits the cap

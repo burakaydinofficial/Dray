@@ -67,6 +67,10 @@ struct Streamer::Impl {
     UncondRing        ring;
 
     uint32_t pass_count = 0;   // forward passes seen (embedding lookups)
+    // The OS-measured memory the ledger cannot explain, and the step it is charged
+    // in (rebudget_against_rss); kept for the readout.
+    uint64_t unexplained_measured = 0;
+    uint64_t unexplained_step = 0;
     uint64_t compacted = 0;    // MUL_MAT_ID/GET_ROWS nodes served compacted
     // Widest single batched union region (uniq(n_seq) x slot): the measured
     // admission floor. Certain death below 1x (B=38), proven clean at 2x (B=32).

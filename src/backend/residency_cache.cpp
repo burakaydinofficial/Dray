@@ -127,7 +127,14 @@ bool ResidencyCache::make_room(uint64_t need) {
 void ResidencyCache::demote_static_to_allowance() {
     while (static_used_ > static_allowance()) {
         bool demoted = false;
-        for (auto& kv : entries_) {
+        // Least recently used first, from the LRU list. Walking entries_ instead
+        // demoted whichever pin the hash of its tensor ADDRESS put first --
+        // addresses differ run to run, so identical runs demoted different
+        // tensors and read different bytes afterwards (2026-10-07).
+        for (auto lit = lru_.rbegin(); lit != lru_.rend(); ++lit) {
+            auto eit = entries_.find(*lit);
+            if (eit == entries_.end()) continue;
+            auto& kv = *eit;
             if (!kv.second.pinned) continue;
             const Source* s = tensors_.source_of(kv.first);
             if (!s) continue;           // NO-SOURCE entry: see below
