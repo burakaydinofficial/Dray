@@ -28,7 +28,8 @@
 
 param(
     [string]$BinDir = (Join-Path $PSScriptRoot "..\build\dray-vk\bin"),
-    [int]$Tokens = 12
+    [int]$Tokens = 12,
+    [string]$Only = ""          # substring filter on model name
 )
 
 $ErrorActionPreference = "Continue"
@@ -93,6 +94,7 @@ function Agree($a, $b) {
 
 $fail = 0; $ran = 0; $skipped = @()
 foreach ($m in $models) {
+    if ($Only -and $m.name -notlike "*$Only*") { continue }
     if (-not (Test-Path $m.path)) { $skipped += $m.name; continue }
     $need = [Math]::Max([int]$m.cap.TrimEnd('G'), $(if ($m.resident) { [int]$m.resident.TrimEnd('G') } else { 0 })) + 4
     $free = [int]((Get-Counter '\Memory\Available MBytes').CounterSamples[0].CookedValue / 1024)

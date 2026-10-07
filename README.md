@@ -98,9 +98,10 @@ assumes perfect eviction; measured traffic is higher. K3 at 5 GiB projects 49.3 
 and measured 1,860 GB over the prompt and 32 tokens, 52-54 GiB per forward pass.
 
 **K3 at 5 GiB** is the floor since 2026-10-05: the read-ahead ring gives its memory
-to the cache, and the run says so; 4.6 GB resident. Five of six runs completed with
-correct text (26.9-27.4 s/token); one exited with an error after generating text,
-and that run's log was not kept -- the harness now keeps every failed run's output.
+to the cache, and the run says so; 4.6 GB resident. 13 of 14 runs completed with
+correct text (26.6-27.4 s/token); one exited with an error after generating text and
+its log was not kept. It did not recur in the 13 runs since, including the same
+harness sequence twice; the harness now keeps every failed run's output.
 
 Against the previous table (2026-08-23, Balanced plan, older build): the 35B at 3 GiB
 went from 1.9 s/token to 2.8 tok/s, DeepSeek at 8 GiB from 3.9 s/token to 1.0 tok/s,

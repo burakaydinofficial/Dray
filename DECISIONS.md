@@ -116,7 +116,10 @@ read-ahead ring sat in the same cap. The ring only overlaps reads with compute (
 output is identical without it), so admission now frees it before refusing,
 re-measures, and refuses only if the cache still falls short, saying the ring was
 already off. K3 at 5 GiB and 4k context: correct text over 32 tokens, 4.6 GB
-resident, ~56 GB read per token; 4 GiB stays refused (508 MiB of cache). The 1B-7B
+resident, ~56 GB read per token, 26.6-27.4 s/token; 13 of 14 runs completed clean,
+and the one that exited with an error after generating text did not recur in the 13
+runs since (its log was not kept; the measuring script now keeps every failed run's
+output). 4 GiB stays refused (508 MiB of cache). The 1B-7B
 testbed's minimum moves from 400 to 300 MiB. Configurations that ran before are
 untouched. Going below 5 GiB on K3 means splitting the final projection, which llama
 builds separately in every model's graph code.
@@ -213,8 +216,11 @@ drive. Growing the ring beyond its default buys nothing: it is consumer-limited.
   ggml runs the graph node by node with a full synchronise after each claimed node.
   The default claims every node -- the only shape proven on every architecture --
   and pays for it; `DRAY_FAST_NODES=1` claims only nodes that can reach streamed
-  memory (11-15%, measured before the pool fix below; see Correctness). The cost vanishes into disk time once a model
-  streams more than a few GB per token.
+  memory. That was worth 11-15% while every claimed node built its own thread pool;
+  with the pool fix below it is +-5% with mixed sign (2026-10-06, five models, text
+  identical: Qwen3.6 35B-A3B 3.0 vs 2.8 tok/s, Qwen3.8-27B 2.0 vs 1.9 s/token, K3
+  9.9-10.2 vs 10.3 s/token), so it stays off. The cost vanishes into disk time once a
+  model streams more than a few GB per token.
 - **Thread oversubscription.** ggml's pool spin-waits; with the engine's own threads
   on top, requesting all 22 threads ran about 40x slower. The pool is clamped to
   (cores - 9); decode defaults to 4 threads, prefill to the clamp.
@@ -270,7 +276,11 @@ every token is from a different sequence).
   loads the weight first. `scripts/gpugate.ps1` proves streamed `--gpu` bit-identical
   to llama.cpp's own GPU path (resident mode, repacked kernels and Vulkan fusion off on
   both legs; not the CPU, whose q8 activations flip near-ties). Every earlier GPU
-  prefill figure is withdrawn (see Corrections).
+  prefill figure is withdrawn (see Corrections). Covered (2026-10-06): the 1B-7B
+  testbed, Qwen3.8-27B, Qwen3.6 35B-A3B and DeepSeek V4 Flash bit-identical to the
+  resident GPU path; Qwen3.8-Flash-Next (too big for a resident reference) runs
+  clean with text identical to the CPU. Flash-Next's architecture is only in the
+  newer llama.cpp base the fork carries on a separate branch, not yet the pinned one.
 - **Copies read only the routed experts.** The scheduler copies only the experts a
   split routes to; the copy now reads only those (whole tensors when every routed
   tensor fits the cache). GPU prefill reads the same bytes as CPU prefill: Qwen3.8
