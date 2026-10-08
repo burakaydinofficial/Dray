@@ -226,8 +226,8 @@ ctest --preset dev
 
 C++20, CMake, CPU-only compute by default. llama.cpp is vendored as a pinned submodule:
 our fork's newer branch, which is Unsloth's GLM-5 branch of upstream
-(2026-09-16) plus nine small patches -- the metadata-only loader, scheduler hooks, a
-repack opt-in and the node budget; 10 files, +359/-32 lines. The dev preset is portable (Windows and macOS); a
+(2026-09-16) plus eight small patches -- the metadata-only loader, scheduler hooks and
+the node budget; 8 files, +267/-29 lines. The dev preset is portable (Windows and macOS); a
 linux preset and untested ARM64 crosses exist beside it.
 `-DDRAY_METAL_BUILD=ON` builds the experimental Metal path, runtime-gated by
 `DRAY_METAL=1`.

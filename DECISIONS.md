@@ -400,11 +400,12 @@ measured per model, not assumed. `--kv q4` does not work on Kimi K3 at all
 - CI builds and tests Windows, macOS, Linux and a ThreadSanitizer job on every push.
 - **The llama.cpp base (2026-10-07).** The vendored fork moved to Unsloth's GLM-5
   branch of upstream (2026-09-16, six weeks and 658 upstream commits newer) with this
-  engine's nine patches re-applied: 10 files, +359/-32 lines, kept small so each
+  engine's patches re-applied, then trimmed: a repack opt-in the engine never called
+  was dropped, leaving eight patches in 8 files, +267/-29 lines -- kept small so each
   upstream move stays cheap. It adds GLM-5.3 Flash and Qwen3.8-Flash-Next, and
   replaces the Kimi K3 community code the fork used to carry with upstream's own.
   Verified: golden identical to the old base on every case and byte count, every gate
-  green, every minimum cap clean (K3 5 GiB, Qwen3.8 2.4T 5, MiniMax-M3 8, GLM-5.3
+  green (Linux included), every minimum cap clean (K3 5 GiB, Qwen3.8 2.4T 5, MiniMax-M3 8, GLM-5.3
   Flash 4, Flash Next 8), speed equal within noise in interleaved runs. Two archgate
   expectations changed because upstream changed: Qwen3.6 35B-A3B's text with a
   quantised KV cache (identical across bases with f16; on the new base llama's own
