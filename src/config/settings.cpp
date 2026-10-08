@@ -67,7 +67,7 @@ Settings builtin_settings() {
     s.serve_kv_idle_timeout_s.value = 600;
     s.serve_kv_pool_tokens.value = -1;           // context x max_parallel
     s.gpu_vram_cap.value = 0;                     // automatic, see below
-    s.gpu_vram_auto_fraction.value = 0.25;        // the owner's rule: a part of the machine
+    s.gpu_vram_auto_fraction.value = 0.40;        // the owner's rule: a part of the machine (0.25 until 2026-10-07)
     s.gpu_vram_auto_fraction_small.value = 0.5;
     s.gpu_vram_small_card.value = 2ull << 30;
     return s;

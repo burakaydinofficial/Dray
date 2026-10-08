@@ -174,6 +174,7 @@ LZ_TEST(the_vram_cap_is_a_hard_size_set_only_by_the_machine) {
     Settings s = builtin_settings();
     std::string err;
     LZ_CHECK_EQ(s.gpu_vram_cap.value, 0u);                        // automatic by default
+    LZ_CHECK(s.gpu_vram_auto_fraction.value == 0.40);             // the owner's rule since 2026-10-07
     LZ_REQUIRE(system_json("{ \"schema\": 1, \"gpu\": {\"vram_cap\": \"2G\"} }", &s, &err));
     LZ_CHECK_EQ(s.gpu_vram_cap.value, 2ull << 30);
     LZ_REQUIRE(system_json("{ \"schema\": 1, \"gpu\": {\"vram_cap\": \"1536M\"} }", &s, &err));

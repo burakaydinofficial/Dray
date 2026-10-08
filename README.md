@@ -121,22 +121,40 @@ models are no longer on this machine.
 > `scripts/gpugate.ps1` now proves `--gpu` bit-identical to llama.cpp's own GPU
 > path on every architecture that fits resident here.
 >
-> Measured 2026-10-06 (High performance plan, idle machine, 8k context), on a fixed
-> 3,264-token prompt -- the first 9,000 characters of this README as of 2026-10-01 --
-> with defaults: the automatic 1.94 GiB VRAM limit chooses the chunk. Seconds until
-> generation starts, both including ~5 s of load:
+> Measured 2026-10-07 (High performance plan, idle machine, 8k context, G/C/C/G), on a
+> fixed 3,264-token prompt -- the first 9,000 characters of this README as of
+> 2026-10-01 -- with the defaults of that day: a 1.94 GiB VRAM limit (25% of the card) chose the chunk.
+> Seconds until generation starts, both including ~5 s of load:
 >
 > | model | cap | CPU | `--gpu` | GB read CPU / GPU |
 > |---|---|---|---|---|
-> | Qwen3.6 35B-A3B | 12 GiB | 106.1 / 106.7 | **36.9-42.6** (1024-token chunks) | 100.4 / 62.2 |
-> | Qwen3.8-27B dense | 16 GiB | 553.3 | **47.6 / 49.5** (512-token chunks) | 35.1 / 43.8 |
+> | Qwen3.6 35B-A3B | 12 GiB | 109.5 / 114.4 | **24.1 / 22.0** (1024-token chunks) | 100.3 / 62.2 |
+> | Qwen3.8-27B dense | 16 GiB | 503.8 / 519.1 | **46.8 / 41.4** (512-token chunks) | 35.2 / 44.1 |
 >
 > The dense model's GPU path reads more: every weight is copied per chunk, while
-> the CPU path keeps part of the model cached. The 2026-10-01 figures this replaces
-> (CPU 133.9 and 707.1 s, GPU 16.8 and 33 s) were taken on a shorter prompt -- that
-> day's README -- and the CPU ones with a fresh thread pool per graph node; they are
-> withdrawn rather than compared. On this prompt the 2026-10-01 build takes 55-56 s
-> for the 35B with `--gpu`, the current one 37-43 s.
+> the CPU path keeps part of the model cached. The 2026-10-06 version of this table
+> had the 35B's `--gpu` leg at 36.9-42.6 s; the machine was slow for GPU work that
+> day (the 2026-10-01 binary took 55-56 s then, 26.7 s now), so it is replaced, not
+> compared.
+>
+> **The VRAM limit sets the chunk, and the chunk sets the bytes.** Each chunk re-reads
+> and re-copies the weights it needs, so fewer, larger chunks cost less. Same prompt,
+> same text at every setting:
+>
+> | model | `--vram-cap` | chunk (VRAM used) | `--gpu` | GB read |
+> |---|---|---|---|---|
+> | Qwen3.6 35B-A3B | default (1.94 GiB) | 1024 (1.47 GiB) | 22.0 / 24.1 s | 62.2 |
+> | | 3 or 5 GiB | 2048 (2.44 GiB) | 12.3-14.1 s | 36.8 |
+> | | 5 GiB, `--prefill-chunk 4096` | 4096 (4.62 GiB) | 10.4 / 12.4 s | 20.8 |
+> | Qwen3.8-27B dense | default (1.94 GiB) | 512 (1.46 GiB) | 41.4 / 46.8 s | 44.1 |
+> | | 3 GiB | 1024 (2.34 GiB) | 29.0 / 29.7 s | 35.7 |
+> | | 5 GiB | 2048 (3.52 GiB) | 22.7 / 23.4 s | 28.9 |
+>
+> Both tables were taken with the default then in force, a quarter of the card. Since
+> 2026-10-07 the default is 40% (3.10 GiB here): the 35B now prefills in 2048-token
+> chunks and the 27B in 1024, the 3 GiB rows above (same text, same bytes). It is
+> still a share of the card, borrowed the way `--cap` borrows RAM; `--vram-cap` (or
+> `gpu.vram_cap`) sets it outright.
 
 GPU decode LOSES on every model measured, in all fifteen comparable pairs, so
 `--gpu` is worth flipping for prompt-heavy work and not otherwise. It also

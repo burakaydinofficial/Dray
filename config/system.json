@@ -35,7 +35,7 @@
         // --vram-cap overrides it. A configuration that cannot fit is
         // refused at load with the VRAM it needs.
         "vram_cap": 0,
-        "vram_auto_fraction": 0.25,
+        "vram_auto_fraction": 0.4,
         "vram_auto_fraction_small": 0.5,
         "vram_small_card": "2G"
     },

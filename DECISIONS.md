@@ -303,9 +303,12 @@ every token is from a different sequence).
   dense model's every weight is copied per chunk, while the CPU path keeps part of
   it cached.
 - **A hard VRAM limit, like the cap.** `gpu.vram_cap` (system settings, a size) or
-  `--vram-cap`; unset, a quarter of the card (half on a card of at most 2 GiB). The
+  `--vram-cap`; unset, 40% of the card (half on a card of at most 2 GiB). The
   prefill chunk is halved until the GPU context fits, or the run is refused with the
-  VRAM it needs.
+  VRAM it needs. The default was a quarter until 2026-10-07; at 40% an 8 GB laptop
+  card's limit is 3.10 GiB instead of 1.94, so the 35B prefills in 2048-token chunks
+  instead of 1024 and the 27B in 1024 instead of 512 (fewer bytes, same text; timings
+  below).
 - **Context-sized work stays with a KV cache kept in RAM** when VRAM requires it:
   attention and sparse-attention indexer scores against every cached key are sized by
   the context, reserved for a full one. With the fork's opt-in scheduler rule those
@@ -325,6 +328,17 @@ every token is from a different sequence).
   the main thread waiting on fences). The fork now turns op offload off for decode
   batches. 35B, 12 GiB: `--gpu` decode 2.9-3.0 -> 3.7-4.2 tok/s, against 3.6-3.9
   without `--gpu`; text identical; a 1852-token prefill still offloads.
+- **Prefill time is bytes, and the VRAM limit sets the bytes (2026-10-07).** A 35B
+  prefill at 12 GiB (17 s, 3,264 tokens) is 6.4-6.9 s of disk reads, 6.1 s of copies
+  to the GPU, 1.55 s of GPU compute (Vulkan's own timer), ~0.2 s of CPU work and ~2.5 s
+  of everything else, synchronisation included. The scheduler starts a split for every
+  host weight (844 per 1024-token chunk); grouping them could save at most that last
+  ~2.5 s, at a cost in VRAM and minimum cap, so it was not pursued. Each chunk re-reads
+  the experts it routes to, so a larger VRAM limit (a larger chunk) is the real lever:
+  the 35B goes from 22-24 s at the default 1.94 GiB to 12.3-14.1 s at 3-5 GiB (chunk
+  2048) and 10.4-12.4 s in one 4096-token chunk; the 27B from 41-47 s to 29 s (3 GiB)
+  and 23 s (5 GiB). Same text at every setting. Reads and copies still run one after
+  the other; overlapping them is the next engine-side lever.
 
 ---
 

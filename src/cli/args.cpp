@@ -44,7 +44,7 @@ void usage() {
         "  --config-dir DIR user settings directory (system.json, models/<arch>.json);\n"
         "                   default DRAY_CONFIG_DIR, else the platform config dir\n"
         "  --vram-cap 2G    HARD limit on VRAM for --gpu (settings: gpu.vram_cap;\n"
-        "                   default: a quarter of the card, half on a small one)\n"
+        "                   default: 40%% of the card, half on a small one)\n"
         "  --force-stream   keep the streaming path even when the model fits\n"
         "  --override-kv    key=int|float|bool|str:value, GGUF metadata override\n"
         "  --repack DIR     use the repacked companion made by `repack --out DIR`\n"
