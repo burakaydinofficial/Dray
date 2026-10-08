@@ -210,6 +210,17 @@ more bytes than it saved, and at tight caps there is no room to hold them.
 Install-time repacking into interleaved layouts is correct and neutral on this
 drive. Growing the ring beyond its default buys nothing: it is consumer-limited.
 
+**Adjacent expert reads are merged (2026-10-08).** Each routed expert used to be one
+request (~640 KB on Qwen3.6 35B-A3B). A prompt chunk routes nearly every expert, and
+an expert tensor's experts sit next to each other on disk and in the region they land
+in, so slices adjacent in both are merged -- up to the batch's bytes over the queue
+depth, the largest requests that still keep the queue full (one request per run was
+slower: the drive saw too few at once). Same bytes, same text; 2.6x fewer requests.
+Timed interleaved over three sessions whose identical runs spread ~25% (n=9 each): the
+35B's `--gpu` prefill 12.4 -> 11.8 s at the default chunk and 19.5 -> 17.8 s at 1024
+tokens, CPU prefill about 3% -- within one to two standard errors, consistent in
+direction, and free.
+
 ---
 
 ## Compute
@@ -337,8 +348,20 @@ every token is from a different sequence).
   the experts it routes to, so a larger VRAM limit (a larger chunk) is the real lever:
   the 35B goes from 22-24 s at the default 1.94 GiB to 12.3-14.1 s at 3-5 GiB (chunk
   2048) and 10.4-12.4 s in one 4096-token chunk; the 27B from 41-47 s to 29 s (3 GiB)
-  and 23 s (5 GiB). Same text at every setting. Reads and copies still run one after
-  the other; overlapping them is the next engine-side lever.
+  and 23 s (5 GiB). Same text at every setting. The reads are the bound, not their
+  ordering: a third of them already land while copies run, and prefill time is the
+  bytes over a near-constant ~3.6 GB/s, below the drive's 6 GB/s at 2 MiB requests.
+  Merging adjacent expert reads (see The I/O path) took a little of that back.
+- **Reading the next layer ahead pays on some models (2026-10-08).** With
+  `prefill.gpu_read_ahead`, once a layer's expert copy lands, the next layer's experts
+  of that kind are read into the freed buffer, guessing the same routing; the copy then
+  reads only what the guess missed, and only copies that routed at least half the
+  experts trigger it (below that, a guess wastes more than it saves). Same prompt,
+  off/on/on/off, same text: DeepSeek V4 Flash 43.3 -> 37.4 s, GLM-5.3 Flash 79.2 ->
+  66.7 s, Qwen3.8-Flash-Next 63.6 -> 54.6 s, MiniMax-M3 82.1 -> 72.6 s, for 5-27% more
+  bytes; Qwen3.6 35B-A3B gained nothing. Off by default, on in those four models'
+  files. With it forced on, gpugate still finds the 35B bit-identical to llama's own
+  GPU path.
 
 ---
 

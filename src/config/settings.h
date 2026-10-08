@@ -66,6 +66,12 @@ struct Settings {
     // Prefill physical batch (tokens), CPU-only and with --gpu.
     Setting<int> prefill_chunk_cpu;
     Setting<int> prefill_chunk_gpu;
+    // --gpu prefill: once an expert copy lands, read the next layer's experts of that
+    // kind ahead, guessing the same routing (ExpertCompactor::read_ahead_next_layer).
+    // Fills drive idle time at the price of the guesses the next layer does not use
+    // (Qwen3.6 35B-A3B: 12-19% more bytes for ~2-4% beyond merged reads) -- a model
+    // that gains more may turn it on in its own file.
+    Setting<bool> prefill_gpu_read_ahead;
     // Share of the bytes a pass reads that the frequency cache may copy into
     // slots in that pass (see backend::Config::admit_byte_fraction).
     Setting<double> admit_byte_fraction;

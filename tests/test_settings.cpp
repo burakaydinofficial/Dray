@@ -107,6 +107,23 @@ LZ_TEST(a_model_file_cannot_set_hardware) {
     LZ_CHECK_EQ(s.decode_threads.value, builtin_settings().decode_threads.value);
 }
 
+LZ_TEST(gpu_read_ahead_is_off_unless_the_machine_or_a_model_turns_it_on) {
+    Settings s = builtin_settings();
+    std::string err;
+    LZ_CHECK(!s.prefill_gpu_read_ahead.value);                       // costs bytes: off
+    // A model whose prefill gains from it opts in in its own file ...
+    LZ_REQUIRE(model_json("{ \"schema\": 1, \"overrides\": {\"prefill\": {\"gpu_read_ahead\": true}} }",
+                          "", &s, &err));
+    LZ_CHECK(s.prefill_gpu_read_ahead.value);
+    LZ_CHECK(s.prefill_gpu_read_ahead.source == Source::UserModel);
+    // ... and the machine may set it for everything.
+    Settings m = builtin_settings();
+    LZ_REQUIRE(system_json("{ \"schema\": 1, \"prefill\": {\"gpu_read_ahead\": true} }", &m, &err));
+    LZ_CHECK(m.prefill_gpu_read_ahead.value);
+    LZ_CHECK(!system_json("{ \"schema\": 1, \"prefill\": {\"gpu_read_ahead\": 1} }", &m, &err));
+    LZ_CHECK(err.find("true or false") != std::string::npos);
+}
+
 LZ_TEST(typos_and_wrong_types_are_errors_never_ignored) {
     Settings s = builtin_settings();
     std::string err;

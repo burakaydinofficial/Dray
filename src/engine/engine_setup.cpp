@@ -179,6 +179,7 @@ bool Engine::start_streamer(const EngineConfig& cfg, bool gpu_consent, std::stri
     scfg.cap = cfg.cap;
     scfg.queue_depth = static_cast<uint32_t>(settings_.queue_depth.value);
     scfg.admit_byte_fraction = settings_.admit_byte_fraction.value;
+    scfg.gpu_read_ahead = settings_.prefill_gpu_read_ahead.value;
     scfg.slow_load = env_is_one("DRAY_SLOW_LOAD");
     scfg.no_compact = env_is_one("DRAY_NO_COMPACT");
     scfg.n_seq = sequences(cfg);   // churn reserve scales with the union working set

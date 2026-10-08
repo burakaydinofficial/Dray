@@ -1,0 +1,16 @@
+// GLM-5.3 Flash (GGUF general.architecture "glm5next").
+//
+// Everything GGUF exposes is read from the GGUF at load; this file carries only
+// policy this model differs on.
+{
+    "schema": 1,
+    "arch": "glm5next",
+    "overrides": {
+        "prefill": {
+            // --gpu prefill reads the next layer's experts ahead (2026-10-08, 12 GiB,
+            // 3,264-token prompt, off/on/on/off): 79.6/78.7 s -> 64.9/68.4 s, bytes
+            // 178.5 -> 187.4 GB, same text.
+            "gpu_read_ahead": true
+        }
+    }
+}

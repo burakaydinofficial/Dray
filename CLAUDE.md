@@ -244,9 +244,11 @@ config/system.json              # machine settings + policy (shipped default; th
 config/models/<arch>.json       # the ONLY place a model is named: what the GGUF
                                 # cannot tell us (kv_defaults) and any policy the
                                 # model must differ on ("overrides"), optionally per
-                                # GGUF file ("files"). minimax-m3.json is the one that
-                                # exists; every other model runs with NO file (the
-                                # planner is arch-blind) and gets one only if it needs it.
+                                # GGUF file ("files"). Four exist: minimax-m3 (kv_defaults),
+                                # and deepseek4, glm5next, qwen4exp, minimax-m3 opting into
+                                # prefill.gpu_read_ahead, each with its measurement (2026-10-08);
+                                # every other model runs with NO file (the planner is arch-blind)
+                                # and gets one only if it needs it.
 src/config/settings.{h,cpp}     # the layers, strict parsing, the readout
 ```
 

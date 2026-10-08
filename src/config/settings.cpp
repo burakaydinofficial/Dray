@@ -59,6 +59,7 @@ Settings builtin_settings() {
     s.queue_depth.value = 64;
     s.prefill_chunk_cpu.value = 512;    // llama.cpp's own n_batch default
     s.prefill_chunk_gpu.value = 2048;   // amortises the PCIe weight transfer
+    s.prefill_gpu_read_ahead.value = false;   // costs bytes; a model may opt in
     s.admit_byte_fraction.value = 0.10;
     s.serve_max_parallel.value = 1;               // one generation at a time until configured
     s.serve_prefill_tokens_per_step.value = 256;
@@ -94,6 +95,12 @@ bool take_int(const Layer& l, const json& v, const std::string& key, int64_t lo,
         return fail(l, key, "must be in [" + std::to_string(lo) + ", " + std::to_string(hi) + "]");
     }
     s->set(static_cast<int>(x), l.source, l.origin);
+    return true;
+}
+
+bool take_bool(const Layer& l, const json& v, const std::string& key, Setting<bool>* s) {
+    if (!v.is_boolean()) return fail(l, key, "must be true or false");
+    s->set(v.get<bool>(), l.source, l.origin);
     return true;
 }
 
@@ -148,6 +155,8 @@ bool apply_policy_section(const Layer& l, const std::string& name, const json& v
             ok = take_int(l, val, key, 16, 8192, &s->prefill_chunk_cpu);
         } else if (name == "prefill" && k == "chunk_gpu") {
             ok = take_int(l, val, key, 16, 8192, &s->prefill_chunk_gpu);
+        } else if (name == "prefill" && k == "gpu_read_ahead") {
+            ok = take_bool(l, val, key, &s->prefill_gpu_read_ahead);
         } else if (name == "cache" && k == "admit_byte_fraction") {
             ok = take_fraction(l, val, key, &s->admit_byte_fraction);
         } else if (name == "serve" && k == "max_parallel") {
@@ -394,6 +403,7 @@ void describe(const Settings& s, std::ostream& o) {
     line(o, "io.queue_depth", s.queue_depth, std::to_string(s.queue_depth.value));
     line(o, "prefill.chunk_cpu", s.prefill_chunk_cpu, std::to_string(s.prefill_chunk_cpu.value));
     line(o, "prefill.chunk_gpu", s.prefill_chunk_gpu, std::to_string(s.prefill_chunk_gpu.value));
+    line(o, "prefill.gpu_read_ahead", s.prefill_gpu_read_ahead, s.prefill_gpu_read_ahead.value ? "true" : "false");
     std::ostringstream f;
     f << s.admit_byte_fraction.value;
     line(o, "cache.admit_byte_fraction", s.admit_byte_fraction, f.str());

@@ -459,14 +459,43 @@ bool IoScheduler::settle(std::vector<uint64_t>& tags, bool* backend_dead) {
 // ---------------------------------------------------------------------------
 // whole reads
 
-bool IoScheduler::read_batch(const std::vector<Slice>& slices) {
-    if (slices.empty()) return true;
+void coalesce_slices(std::vector<Slice>& v, uint64_t max_len) {
+    if (v.size() < 2) return;
+    std::sort(v.begin(), v.end(), [](const Slice& a, const Slice& b) {
+        return a.src.shard != b.src.shard ? a.src.shard < b.src.shard : a.src.offset < b.src.offset;
+    });
+    size_t o = 0;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (o > 0) {
+            Slice& b = v[o - 1];
+            if (b.src.shard == v[i].src.shard && b.src.offset + b.len == v[i].src.offset &&
+                b.dst + b.len == v[i].dst && b.len + v[i].len <= max_len) {
+                b.len += v[i].len;
+                continue;
+            }
+        }
+        v[o++] = v[i];
+    }
+    v.resize(o);
+}
+
+uint64_t IoScheduler::merge_limit(uint64_t total) const {
+    const uint64_t depth = io_ ? static_cast<uint64_t>(io_->max_in_flight()) : 1;
+    return total / (depth ? depth : 1);
+}
+
+bool IoScheduler::read_batch(const std::vector<Slice>& in) {
+    if (in.empty()) return true;
     {
         Lock lk(m_);
         ++stats_.io_batches;
-        stats_.io_slices += slices.size();
-        if (slices.size() > stats_.io_batch_max) stats_.io_batch_max = slices.size();
+        stats_.io_slices += in.size();
+        if (in.size() > stats_.io_batch_max) stats_.io_batch_max = in.size();
     }
+    std::vector<Slice> slices = in;
+    uint64_t total = 0;
+    for (const Slice& s : slices) total += s.len;
+    coalesce_slices(slices, merge_limit(total));
 
     std::vector<uint64_t> tags;
     tags.reserve(slices.size());

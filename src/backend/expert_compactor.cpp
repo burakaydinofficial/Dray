@@ -547,6 +547,63 @@ uint8_t* landing_in(uint8_t* slot, uint64_t slot_bytes, uint64_t g_bytes, uint32
 
 }  // namespace
 
+bool ExpertCompactor::slot_begin(CopySlot& slot, const ggml_tensor* w, const Source& src) {
+    settle_slot(slot);   // whatever was in flight must land before the region is reused
+    slot.w = nullptr;
+    slot.data = nullptr;
+    slot.present.clear();
+    slot.experts.clear();
+    if (!slot.mem) return false;
+    const uint64_t stride = static_cast<uint64_t>(w->nb[2]);
+    const RegionGeom g = region_geom(src, stride, stride * static_cast<uint64_t>(w->ne[2]));
+    uint8_t* data = landing_in(slot.mem, slot.bytes, g.bytes, g.align, g.head);
+    if (!data) return false;
+    slot.w = w;
+    slot.data = data;
+    slot.present.assign(static_cast<size_t>(w->ne[2]), 0);
+    return true;
+}
+
+bool ExpertCompactor::slot_submit(CopySlot& slot, const ggml_tensor* w, const Source& src,
+                                  const int32_t* want, int64_t n, uint64_t* streamed) {
+    const uint64_t stride = static_cast<uint64_t>(w->nb[2]);
+    const uint64_t dstride = src.disk_stride ? src.disk_stride : stride;
+    std::vector<Slice> slices;
+    for (int64_t i = 0; i < n; ++i) {
+        const int32_t e = want[i];
+        if (e < 0 || e >= w->ne[2] || slot.present[static_cast<size_t>(e)]) continue;
+        uint8_t* dst = slot.data + static_cast<uint64_t>(e) * stride;
+        slot.present[static_cast<size_t>(e)] = 1;
+        if (const void* c = p_.slots.hit(w, e)) {
+            std::memcpy(dst, c, static_cast<size_t>(stride));
+            continue;
+        }
+        Slice s;
+        s.src = src;
+        s.src.offset += static_cast<uint64_t>(e) * dstride;
+        s.dst = dst;
+        s.len = stride;
+        slices.push_back(s);
+    }
+    const uint64_t misses = slices.size();
+    coalesce_slices(slices, p_.io.merge_limit(misses * stride));
+    bool fail = false;
+    for (size_t i = 0; i < slices.size() && !fail; ++i) {
+        fail = !p_.io.submit_exact(slices[i].src, slices[i].dst, slices[i].len, &slot.tags);
+        slot.pending = true;   // even on a failed submit: what was submitted must settle
+    }
+    if (fail) {
+        settle_slot(slot);
+        slot.w = nullptr;
+        return false;
+    }
+    // Bytes are counted when read; demand when a copy asks (read_experts_for_copy), so a
+    // read-ahead no copy used shows as read and never demanded.
+    *streamed += misses * stride;
+    p_.hits.add_routed(0, misses * stride);
+    return true;
+}
+
 uint8_t* ExpertCompactor::read_experts_for_copy(ggml_tensor* w, const int32_t* experts, int64_t n,
                                                 uint8_t** mem, uint64_t* bytes, uint64_t* streamed) {
     const Source* src = p_.tensors.source_of(w);
@@ -556,38 +613,39 @@ uint8_t* ExpertCompactor::read_experts_for_copy(ggml_tensor* w, const int32_t* e
     }
     const uint64_t stride = static_cast<uint64_t>(w->nb[2]);
     const uint64_t need = stride * static_cast<uint64_t>(w->ne[2]);
-    const RegionGeom g = region_geom(*src, stride, need);
 
-    uint8_t* data = nullptr;
+    // The slot may already hold some or all of these experts: read ahead (wait for it),
+    // or still there from an earlier copy (weights do not change, so they stay valid).
     CopySlot& slot = copy_slots_[copy_kind(w)];
-    // The slot holds this tensor with this routing: read ahead (wait for it) or still
-    // there from an earlier copy (its contents are unchanged since).
-    const bool same = slot.data && slot.w == w && slot.experts.size() == static_cast<size_t>(n) &&
-                      std::equal(slot.experts.begin(), slot.experts.end(), experts);
     const bool was_pending = slot.pending;
+    const bool held = slot.mem && slot.data && slot.w == w;
     const bool ok = settle_slot(slot);
-    if (same && ok && slot.mem) {
+    uint8_t* data = nullptr;
+    if (held && ok && slot.mem) {
         ++copy_prefetch_hits_;
-        if (!was_pending) p_.hits.add_routed(static_cast<uint64_t>(n) * stride, 0);   // served from RAM
-        *mem = slot.data;
-        *bytes = 0;
-        return slot.data;
-    }
-    if (was_pending) ++copy_prefetch_misses_;
-    slot.w = nullptr;
-    if ((data = landing_in(slot.mem, slot.bytes, g.bytes, g.align, g.head)) != nullptr) {
+        data = slot.data;
         *mem = data;
         *bytes = 0;
     } else {
-        uint32_t head = 0;
-        if (!alloc_region(*src, stride, need, mem, bytes, &head, nullptr)) return nullptr;
-        data = *mem + head;
+        if (was_pending) ++copy_prefetch_misses_;   // read ahead for something else
+        if (slot_begin(slot, w, *src)) {
+            data = slot.data;
+            *mem = data;
+            *bytes = 0;
+        } else {
+            uint32_t head = 0;
+            if (!alloc_region(*src, stride, need, mem, bytes, &head, nullptr)) return nullptr;
+            data = *mem + head;
+        }
     }
+    // Whatever is not there yet, in one deep batch.
+    const bool in_slot = *bytes == 0;
     const uint64_t dstride = src->disk_stride ? src->disk_stride : stride;
     std::vector<Slice> slices;
     slices.reserve(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i) {
         const int32_t e = experts[i];
+        if (in_slot && slot.present[static_cast<size_t>(e)]) continue;
         uint8_t* dst = data + static_cast<uint64_t>(e) * stride;
         if (const void* c = p_.slots.hit(w, e)) {
             std::memcpy(dst, c, static_cast<size_t>(stride));
@@ -602,15 +660,15 @@ uint8_t* ExpertCompactor::read_experts_for_copy(ggml_tensor* w, const int32_t* e
     }
     if (!slices.empty() && !p_.io.read_batch(slices)) {
         if (*bytes) p_.mem.free(mem::Category::ExpertCache, *mem, *bytes);
+        if (in_slot) slot.w = nullptr;   // partly written: hold nothing
         return nullptr;
     }
     const uint64_t read = static_cast<uint64_t>(slices.size()) * stride;
     *streamed += read;
     p_.hits.add_routed(static_cast<uint64_t>(n) * stride, read);
-    if (*bytes == 0) {   // landed in the slot: remember what it holds
-        slot.w = w;
+    if (in_slot) {   // remember what it holds, and the routing (the next layer's guess)
+        for (int64_t i = 0; i < n; ++i) slot.present[static_cast<size_t>(experts[i])] = 1;
         slot.experts.assign(experts, experts + n);
-        slot.data = data;
     }
     return data;
 }
@@ -633,43 +691,35 @@ void ExpertCompactor::prefetch_copy_siblings(ggml_tensor* w, const int32_t* expe
         bool in_range = true;
         for (int64_t i = 0; i < n && in_range; ++i) in_range = experts[i] >= 0 && experts[i] < sib->ne[2];
         if (!in_range) continue;
-        // Already there (read ahead, or copied earlier with this routing): nothing to do.
-        if (slot.w == sib && slot.experts.size() == static_cast<size_t>(n) &&
-            std::equal(slot.experts.begin(), slot.experts.end(), experts)) {
-            continue;
-        }
-        settle_slot(slot);   // an unclaimed read-ahead: its slot is about to be reused
-        slot.w = nullptr;
-        if (!slot.mem) continue;
-        const uint64_t stride = static_cast<uint64_t>(sib->nb[2]);
-        const RegionGeom g = region_geom(*src, stride, stride * static_cast<uint64_t>(sib->ne[2]));
-        uint8_t* data = landing_in(slot.mem, slot.bytes, g.bytes, g.align, g.head);
-        if (!data) continue;
-        const uint64_t dstride = src->disk_stride ? src->disk_stride : stride;
-        uint64_t misses = 0;
-        bool fail = false;
-        for (int64_t i = 0; i < n && !fail; ++i) {
-            const int32_t e = experts[i];
-            uint8_t* dst = data + static_cast<uint64_t>(e) * stride;
-            if (const void* c = p_.slots.hit(sib, e)) {
-                std::memcpy(dst, c, static_cast<size_t>(stride));
-                continue;
-            }
-            Source s = *src;
-            s.offset += static_cast<uint64_t>(e) * dstride;
-            fail = !p_.io.submit_exact(s, dst, stride, &slot.tags);
-            ++misses;
-        }
-        slot.pending = true;   // even on a failed submit: what was submitted must settle
-        if (fail) {
-            settle_slot(slot);
-            continue;
-        }
-        slot.w = sib;
-        slot.experts.assign(experts, experts + n);
-        slot.data = data;
-        *streamed += misses * stride;
-        p_.hits.add_routed(static_cast<uint64_t>(n) * stride, misses * stride);
+        // A sibling copied earlier in this layer: its slot is already reading the next
+        // layer's tensor ahead (read_ahead_next_layer). Leave it.
+        if (const auto nit = next_of_.find(sib); nit != next_of_.end() && slot.w == nit->second) continue;
+        // Otherwise add what this routing needs to what the slot holds for sib (a
+        // read-ahead's guess, an earlier copy), or start it over for sib.
+        if (!(slot.w == sib && slot.data) && !slot_begin(slot, sib, *src)) continue;
+        slot_submit(slot, sib, *src, experts, n, streamed);
+    }
+}
+
+void ExpertCompactor::read_ahead_next_layer(const ggml_tensor* w, uint64_t* streamed) {
+    if (!w || !read_ahead_) return;
+    const auto it = next_of_.find(w);
+    if (it == next_of_.end()) return;
+    ggml_tensor* nx = it->second;
+    CopySlot& slot = copy_slots_[copy_kind(w)];
+    if (!slot.mem || slot.w != w || slot.experts.empty()) return;   // must hold w's finished copy
+    // The guess: the next layer routes like this one. With routing independent across
+    // layers a guessed expert is used with probability n/E, so below half the experts
+    // the guess would read more bytes for nothing than it saves; then read nothing ahead.
+    // A prompt chunk routes nearly all of them; a few tokens do not.
+    const std::vector<int32_t> guess = slot.experts;
+    if (guess.size() * 2 < static_cast<size_t>(w->ne[2])) return;
+    const Source* src = p_.tensors.source_of(nx);
+    if (!src || nx->ne[2] <= 1) return;
+    if (const Resident* r = p_.cache.find(nx); r && r->mem && r->uniq.empty()) return;   // whole in RAM
+    if (!slot_begin(slot, nx, *src)) return;
+    if (slot_submit(slot, nx, *src, guess.data(), static_cast<int64_t>(guess.size()), streamed)) {
+        ++copy_layer_ahead_;
     }
 }
 

@@ -1,0 +1,16 @@
+// DeepSeek V4 Flash (GGUF general.architecture "deepseek4").
+//
+// Everything GGUF exposes is read from the GGUF at load; this file carries only
+// policy this model differs on.
+{
+    "schema": 1,
+    "arch": "deepseek4",
+    "overrides": {
+        "prefill": {
+            // --gpu prefill reads the next layer's experts ahead (2026-10-08, 24 GiB,
+            // 3,264-token prompt, off/on/on/off): 43.6/43.0 s -> 37.5/37.3 s, bytes
+            // 161.7 -> 183.9 GB, same text.
+            "gpu_read_ahead": true
+        }
+    }
+}

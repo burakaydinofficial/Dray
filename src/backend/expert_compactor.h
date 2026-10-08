@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <ostream>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "backend/accounted_alloc.h"
@@ -110,9 +111,23 @@ public:
     static int copy_kind_of(const char* tensor_name);
     void set_copy_slots(uint8_t* const base[kCopyKinds], const uint64_t bytes[kCopyKinds]);
     void prefetch_copy_siblings(ggml_tensor* w, const int32_t* experts, int64_t n, uint64_t* streamed);
+    // The next layer's expert tensor of the same kind, for each expert tensor (built by
+    // the Streamer from the plan's layer order). Empty = no next-layer read-ahead.
+    void set_copy_successors(std::unordered_map<const ggml_tensor*, ggml_tensor*> next) {
+        next_of_ = std::move(next);
+    }
+    // prefill.gpu_read_ahead: whether read_ahead_next_layer reads anything (off by default).
+    void set_read_ahead(bool on) { read_ahead_ = on; }
+    // Called once w's copy has COMPLETED, its slot free again: read the next layer's
+    // tensor of the same kind into the slot now, under the copies and GPU work until that
+    // copy asks, guessing it routes like w's copy did. The slot is a full-size region with
+    // every expert at its own index, so the copy then reads only what the guess missed;
+    // what it guessed and the copy did not use shows as read-ahead waste.
+    void read_ahead_next_layer(const ggml_tensor* w, uint64_t* streamed);
     void settle_copy_slots();
     uint64_t copy_prefetch_hits() const { return copy_prefetch_hits_; }
     uint64_t copy_prefetch_misses() const { return copy_prefetch_misses_; }
+    uint64_t copy_layer_ahead() const { return copy_layer_ahead_; }
 
 private:
     // A sibling region from submission until its own node adopts it. NOT in the
@@ -181,13 +196,24 @@ private:
         uint8_t*              mem = nullptr;   // the pinned slot (caller-owned)
         uint64_t              bytes = 0;
         bool                  pending = false; // reads in flight into it (tags)
-        const ggml_tensor*    w = nullptr;     // what they are for
-        std::vector<int32_t>  experts;
+        const ggml_tensor*    w = nullptr;     // the tensor its full-size region holds experts of
+        std::vector<uint8_t>  present;         // per expert of w: its bytes are there (or in flight)
+        std::vector<int32_t>  experts;         // the routing of the copy it last served: the
+                                               // next layer's guess (read_ahead_next_layer)
         uint8_t*              data = nullptr;
         std::vector<uint64_t> tags;
     };
     CopySlot copy_slots_[kCopyKinds];
-    uint64_t copy_prefetch_hits_ = 0, copy_prefetch_misses_ = 0;
+    uint64_t copy_prefetch_hits_ = 0, copy_prefetch_misses_ = 0, copy_layer_ahead_ = 0;
+    std::unordered_map<const ggml_tensor*, ggml_tensor*> next_of_;   // set_copy_successors
+    bool read_ahead_ = false;                                         // set_read_ahead
+    // Points the slot at w's full-size region, holding nothing yet (settles first). False
+    // if the slot cannot hold w.
+    bool slot_begin(CopySlot& slot, const ggml_tensor* w, const Source& src);
+    // Submits, into the slot, the experts in `want` it does not hold yet (frequency-cache
+    // hits copied from RAM). False if a submit failed; the slot then holds nothing.
+    bool slot_submit(CopySlot& slot, const ggml_tensor* w, const Source& src,
+                     const int32_t* want, int64_t n, uint64_t* streamed);
     // Waits for a slot's reads; false if any failed. A dead backend leaves the slot
     // unusable (its memory is still a DMA target), loudly.
     bool settle_slot(CopySlot& s);

@@ -51,7 +51,13 @@
         "chunk_cpu": 512,
         // ... and with --gpu, where a larger batch amortises moving weights
         // across PCIe. The GPU compute buffer grows with it.
-        "chunk_gpu": 2048
+        "chunk_gpu": 2048,
+        // --gpu: read the next layer's experts while this layer's are being
+        // copied, guessing the same routing. Uses idle drive time, but the
+        // guesses the next layer does not use are read for nothing (Qwen3.6
+        // 35B-A3B: 12-19% more bytes for a few % of prefill time). Off here;
+        // a model whose file sets it gains it.
+        "gpu_read_ahead": false
     },
 
     "cache": {

@@ -8,11 +8,13 @@
 
 #include "backend/stream_buffer.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -193,6 +195,7 @@ Streamer::Streamer(mem::Accountant& acct, const plan::Plan& p, Config cfg)
     im.cache.set_churn_reserve(budget.churn_reserve);
     im.batch_region_bound = budget.batch_region_bound;
     im.compactor.set_funded_union(budget.funded_union);
+    im.compactor.set_read_ahead(cfg.gpu_read_ahead);
     im.cache.set_spill(&im.slots);   // the pool gives memory back under pressure
     if (budget.ring_target) im.ring.allocate(budget.ring_target, im.io.align());
     im.slots.set_pool(budget.eslot_pool(im.ring.bytes()));
@@ -863,7 +866,7 @@ std::string Streamer::report() const {
         o << ", " << im.copies << " GPU copies (weights made present " << im.ns_copy_ready / 1000000
           << "ms, copy until done " << im.ns_copy_done / 1000000 << "ms; read ahead "
           << im.compactor.copy_prefetch_hits() << " used, " << im.compactor.copy_prefetch_misses()
-          << " wasted)";
+          << " wasted, " << im.compactor.copy_layer_ahead() << " next-layer)";
     }
 
     // I/O FORENSICS, off unless asked for (DRAY_IO_STATS=1). These counters
@@ -966,6 +969,24 @@ bool Streamer::set_gpu_copy_pool(uint64_t bytes) {
         off += size[k];
     }
     im.compactor.set_copy_slots(base, size);
+
+    // Each expert tensor's successor of the same kind in layer order: what a GPU copy
+    // reads ahead once the current one has landed (read_ahead_next_layer). From the
+    // plan's tensor table, so layers without experts are simply skipped.
+    std::vector<std::pair<int32_t, ggml_tensor*>> by_kind[ExpertCompactor::kCopyKinds];
+    for (const plan::TensorInfo& t : im.plan.tensors) {
+        if (t.cls != plan::TensorClass::RoutedExpert || t.layer < 0) continue;
+        if (ggml_tensor* w = im.tensors.named(t.name)) {
+            by_kind[ExpertCompactor::copy_kind_of(t.name.c_str())].emplace_back(t.layer, w);
+        }
+    }
+    std::unordered_map<const ggml_tensor*, ggml_tensor*> next;
+    for (auto& v : by_kind) {
+        std::stable_sort(v.begin(), v.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (size_t i = 0; i + 1 < v.size(); ++i) next[v[i].second] = v[i + 1].second;
+    }
+    im.compactor.set_copy_successors(std::move(next));
     return true;
 }
 
@@ -1026,6 +1047,10 @@ void Streamer::copy_end(ggml_tensor*) {
         if (l.bytes) im.mem.free(mem::Category::ExpertCache, l.mem, l.bytes);   // 0: the pinned pool
         l.w->data = l.w_data;
         if (l.t != l.w) l.t->data = l.t_data;
+        // The copy has completed, so its pinned slot is free: if prefill.gpu_read_ahead
+        // is on, start reading the next layer's tensor of this kind into it now, under
+        // the copies and GPU work until that layer's copy asks for it.
+        if (l.bytes == 0) im.compactor.read_ahead_next_layer(l.w, &bytes_streamed_);
         l = Impl::CopyLanding{};
     }
     im.cache.protect_none();   // copied: evictable again

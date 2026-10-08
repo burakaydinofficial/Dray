@@ -79,6 +79,15 @@ struct Slice {
     uint64_t len = 0;
 };
 
+// Merges slices that are adjacent both in their file and in memory, in (shard, offset)
+// order, while a merged read stays within max_len (a slice is never split). A prompt
+// chunk routes nearly every expert, and an expert tensor's experts sit next to each
+// other on disk and in a full-size region: one request per expert (~640 KB on Qwen3.6
+// 35B-A3B) read at ~3.6 GB/s on a drive that does 6 at 2 MiB. Callers pass the batch's
+// bytes over the queue depth, so the queue stays full with the largest requests that
+// fill it (one huge request per run left the drive idle: 2.8-3.0 GB/s).
+void coalesce_slices(std::vector<Slice>& slices, uint64_t max_len);
+
 // I/O forensics, printed only under DRAY_IO_STATS. These counters located
 // the bandwidth defect on 2026-08-24 and are worth keeping.
 struct IoStats {
@@ -194,6 +203,9 @@ public:
     // waited on, so the drive sees a deep queue (the calibrated difference
     // between QD1 0.5-3.4 GB/s and QD16 6.6).
     bool read_batch(const std::vector<Slice>& slices);
+    // The largest merged read that still keeps the queue full for `total` bytes
+    // (coalesce_slices): total over the backend's queue depth.
+    uint64_t merge_limit(uint64_t total) const;
     bool read_exact(const Source& s, void* dst, uint64_t bytes);
     // read_exact through a different handle to the same shard (self_check's
     // fresh handles), reusing the alignment widening verbatim.

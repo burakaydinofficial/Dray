@@ -253,10 +253,14 @@ if (WIN32)
 endif()
 # The shipped settings (config/system.json, config/models/<arch>.json) live next
 # to the binary, where config::default_locations looks for them; copied on every
-# build so an edit to a shipped default is never silently stale.
-add_custom_command(TARGET dray POST_BUILD
+# build so an edit to a shipped default is never silently stale. A target of its
+# own, always run: as a POST_BUILD step of dray it ran only when the binary
+# relinked, so a config-only edit (a new models/<arch>.json) never arrived.
+add_custom_target(dray_shipped_config ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
-            ${CMAKE_CURRENT_SOURCE_DIR}/config $<TARGET_FILE_DIR:dray>/config)
+            ${CMAKE_CURRENT_SOURCE_DIR}/config $<TARGET_FILE_DIR:dray>/config
+    COMMENT "Copying the shipped config next to dray")
+add_dependencies(dray dray_shipped_config)
 
 # --- tests --------------------------------------------------------------------
 include(CTest)

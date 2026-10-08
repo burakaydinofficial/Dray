@@ -155,6 +155,14 @@ models are no longer on this machine.
 > chunks and the 27B in 1024, the 3 GiB rows above (same text, same bytes). It is
 > still a share of the card, borrowed the way `--cap` borrows RAM; `--vram-cap` (or
 > `gpu.vram_cap`) sets it outright.
+>
+> **Reading the next layer ahead pays on some models, not others.** With
+> `prefill.gpu_read_ahead`, once a layer's expert copy lands the next layer's experts are
+> read into the freed buffer, guessing the same routing. Measured 2026-10-08 (same prompt,
+> off/on/on/off, same text): DeepSeek V4 Flash 43.3 -> 37.4 s, GLM-5.3 Flash 79.2 -> 66.7 s,
+> Qwen3.8-Flash-Next 63.6 -> 54.6 s, MiniMax-M3 82.1 -> 72.6 s, for 5-27% more bytes read;
+> Qwen3.6 35B-A3B gained nothing. It is off by default and on in those four models' files
+> (`config/models/`); `dray config -m <model>` shows the value in force and its source.
 
 GPU decode LOSES on every model measured, in all fifteen comparable pairs, so
 `--gpu` is worth flipping for prompt-heavy work and not otherwise. It also

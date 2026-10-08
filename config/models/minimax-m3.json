@@ -21,5 +21,14 @@
         "minimax-m3.attention.indexer.top_k=int:16",
         "minimax-m3.attention.indexer.block_size=int:128",
         "minimax-m3.attention.indexer.local_blocks=int:1"
-    ]
+    ],
+
+    "overrides": {
+        "prefill": {
+            // --gpu prefill reads the next layer's experts ahead (2026-10-08, 16 GiB,
+            // 3,264-token prompt, off/on/on/off): 83.4/80.8 s -> 72.9/72.3 s, bytes
+            // 352.9 -> 406.1 GB, same text.
+            "gpu_read_ahead": true
+        }
+    }
 }

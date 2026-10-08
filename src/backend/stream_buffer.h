@@ -83,6 +83,8 @@ struct Config {
     // and -- unlike a time budget -- keeps bytes read deterministic. Built-in
     // default; the system config overrides it (and a model config may).
     double   admit_byte_fraction = 0.10;
+    // POLICY (prefill.gpu_read_ahead): --gpu copies read the next layer's experts ahead.
+    bool     gpu_read_ahead = false;
 };
 
 // Owns the slab, the shard handles and the tensor->Source map. One per model.
